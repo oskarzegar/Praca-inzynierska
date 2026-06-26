@@ -1,0 +1,9 @@
+$kind: http-request
+name: Get Profile
+method: GET
+url: '{{baseUrl}}/api/profiles/:id'
+order: 1000
+pathVariables:
+  - key: id
+    value: '{{userId}}'
+    description: User UUID

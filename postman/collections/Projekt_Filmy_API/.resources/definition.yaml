@@ -1,0 +1,6 @@
+$kind: collection
+name: Projekt Filmy API
+description: 'API collection for Projekt Filmy – a movie browsing and tracking app. Uses TMDB for movie data and Supabase for user profiles, reviews, watchlists, and watched history.'
+variables:
+  - key: baseUrl
+    value: 'http://localhost:3000'

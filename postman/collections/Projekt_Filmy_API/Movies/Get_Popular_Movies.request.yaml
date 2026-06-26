@@ -1,0 +1,9 @@
+$kind: http-request
+name: Get Popular Movies
+method: GET
+url: '{{baseUrl}}/api/movies/popular'
+order: 1000
+queryParams:
+  - key: page
+    value: '1'
+    description: Page number

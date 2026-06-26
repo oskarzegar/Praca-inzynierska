@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="pl-PL">
+  <head>
+    <!-- Meta tags -->
+    <meta charset="UTF-8" />
+    <base href="/" />
+    <script>(function(){var t=localStorage.getItem('theme');if(t==='light'){document.documentElement.setAttribute('data-theme','light');}else if(!t||t==='system'){if(window.matchMedia('(prefers-color-scheme: light)').matches)document.documentElement.setAttribute('data-theme','light');}})();</script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Browse all movies in one place" />
+
+    <!-- Style & fonts -->
+    <link rel="stylesheet" href="./assets/css/style.css" /><link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,200..800;1,200..800&display=swap" rel="stylesheet" />
+
+    <!-- Favicon -->
+    <link type="image/png" sizes="96x96" rel="icon" href="./icons8-film-reel-96.png" />
+
+    <!-- JS -->
+    <script src="./assets/js/global.js" defer></script>
+    <script src="./assets/js/details.js" type="module" defer></script>
+    <script src="./assets/js/auth.js" type="module"></script>
+  </head>
+  <body>
+    <header class="header">
+      <a href="/" class="logo">
+        <img src="./assets/imgs/logoDarkTheme.svg" class="logo-img logo-dark" height="32" alt="" />
+        <img src="./assets/imgs/logoLightTheme.svg" class="logo-img logo-light" height="32" alt="" />
+        <span class="logo-name">Filmy</span>
+      </a>
+      <div class="search-box" search-box>
+        <div class="search-wrapper" search-wrapper>
+          <input type="text" name="search" class="search-field" aria-label="search movies" placeholder="Wyszukaj" autocomplete="off" search-field />
+          <img src="./assets/imgs/search.svg" width="24" height="24" alt="search" class="leading-icon" />
+        </div>
+
+        <button class="search-btn" search-toggler>
+          <img src="./assets/imgs/close.svg" width="24" height="24" alt="close search box" />
+        </button>
+      </div>
+
+      <button class="search-btn" search-toggler menu-close>
+        <img src="./assets/imgs/search.svg" width="24" height="24" alt="open search box" />
+      </button>
+
+      <button class="menu-btn" menu-btn menu-toggler>
+        <img src="./assets/imgs/menu.svg" width="24" height="24" alt="open menu" class="menu" />
+        <img src="./assets/imgs/menu_close.svg" width="24" height="24" alt="close menu" class="close" />
+      </button>
+    </header>
+    <main>
+      <nav class="sidebar" sidebar></nav>
+      <div class="overlay" overlay menu-toggler></div>
+      <article class="container" page-content></article>
+    </main>
+  </body>
+</html>

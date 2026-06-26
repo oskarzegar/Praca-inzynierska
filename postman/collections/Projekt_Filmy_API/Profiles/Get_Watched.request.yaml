@@ -1,0 +1,9 @@
+$kind: http-request
+name: Get Watched
+method: GET
+url: '{{baseUrl}}/api/profiles/:id/watched'
+order: 3000
+pathVariables:
+  - key: id
+    value: '{{userId}}'
+    description: User UUID

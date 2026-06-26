@@ -1,0 +1,5 @@
+$kind: http-request
+name: OpenAPI Spec
+method: GET
+url: '{{baseUrl}}/api/openapi.json'
+order: 1000

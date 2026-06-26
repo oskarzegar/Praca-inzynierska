@@ -1,0 +1,9 @@
+$kind: http-request
+name: Get Movie Reviews
+method: GET
+url: '{{baseUrl}}/api/movies/:id/reviews'
+order: 4000
+pathVariables:
+  - key: id
+    value: '27205'
+    description: TMDB movie ID

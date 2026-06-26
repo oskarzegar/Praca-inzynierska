@@ -1,0 +1,12 @@
+$kind: http-request
+name: Search Movies
+method: GET
+url: '{{baseUrl}}/api/movies/search'
+order: 2000
+queryParams:
+  - key: query
+    value: Inception
+    description: 'Search query (required)'
+  - key: page
+    value: '1'
+    description: Page number

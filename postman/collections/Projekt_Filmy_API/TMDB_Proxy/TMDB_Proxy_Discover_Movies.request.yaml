@@ -1,0 +1,10 @@
+$kind: http-request
+name: 'TMDB Proxy – Discover Movies'
+method: GET
+url: '{{baseUrl}}/api/tmdb/discover/movie'
+order: 1000
+queryParams:
+  - key: sort_by
+    value: popularity.desc
+  - key: page
+    value: '1'
