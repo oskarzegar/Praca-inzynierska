@@ -1,37 +1,27 @@
-'use strict';
-
 // ============================================================================
 // routes/tmdb.js  –  Proxy do TMDB (klucz API doklejany po stronie serwera)
 //
-// Zabezpieczenia (wcześniej był to otwarty proxy do całego TMDB):
 //   • whitelist ścieżek – tylko zasoby używane przez aplikację,
 //   • rate limit per-IP  – ochrona klucza przed nadużyciem,
 //   • cache + timeout    – w lib/tmdb.js.
 // ============================================================================
 
 import { Router } from 'express';
-import { tmdbProxy, isAllowedTmdbPath } from '../lib/tmdb.js';
+import { tmdbProxy, isAllowedTmdbPath, tmdbFailure } from '../lib/tmdb.js';
+import { createRateLimiter } from '../lib/rateLimit.js';
 
 const router = Router();
 
-// ── Prosty limiter w pamięci (per-IP, okno przesuwne) ───────────────────────
-// Próg jest hojny, by nie blokować normalnych „wybuchów" żądań przy ładowaniu stron,
-// a jednocześnie zatrzymać zautomatyzowane nadużycie klucza.
-const RATE_LIMIT     = 600;          // maks. żądań
-const RATE_WINDOW_MS = 60 * 1000;    // w oknie 60 s
-const hits = new Map();              // ip → number[] (znaczniki czasu żądań)
-
-function rateLimit(req, res, next) {
-  const ip  = req.ip || req.socket?.remoteAddress || 'unknown';
-  const now = Date.now();
-  const recent = (hits.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS);
-  if (recent.length >= RATE_LIMIT) {
-    return res.status(429).json({ error: 'Zbyt wiele zapytań do TMDB. Spróbuj za chwilę.' });
-  }
-  recent.push(now);
-  hits.set(ip, recent);
-  next();
-}
+// Próg jest hojny (600 żądań / 60 s), by nie blokować „wybuchów" żądań przy ładowaniu
+// stron, a jednocześnie zatrzymać zautomatyzowane nadużycie klucza. Ta trasa odpowiada
+// 429 bez nagłówka Retry-After i nie sprząta mapy IP (pruneIdle: false) — znane
+// ograniczenie: mapa rośnie z liczbą różnych adresów IP.
+const rateLimit = createRateLimiter({
+  limit:      600,
+  message:    'Zbyt wiele zapytań do TMDB. Spróbuj za chwilę.',
+  retryAfter: false,
+  pruneIdle:  false,
+});
 
 router.get('*', rateLimit, async (req, res) => {
   if (!isAllowedTmdbPath(req.path)) {
@@ -41,10 +31,8 @@ router.get('*', rateLimit, async (req, res) => {
     const { status, data } = await tmdbProxy(req.path, req.query);
     res.status(status).json(data);
   } catch (err) {
-    const aborted = err?.name === 'AbortError';
-    res
-      .status(aborted ? 504 : 502)
-      .json({ error: aborted ? 'TMDB nie odpowiada (timeout)' : 'Błąd komunikacji z TMDB' });
+    const { status, error } = tmdbFailure(err, 'Błąd komunikacji z TMDB');
+    res.status(status).json({ error });
   }
 });
 

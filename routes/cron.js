@@ -1,5 +1,3 @@
-'use strict';
-
 // ============================================================================
 // routes/cron.js  –  Zadania cykliczne wywoływane przez Vercel Cron
 //
@@ -19,7 +17,8 @@ const router = Router();
 // Vercel wysyła w nagłówku DOKŁADNIE wartość zmiennej CRON_SECRET (np. z cudzysłowami,
 // jeśli ktoś je wkleił). Akceptujemy więc wartość surową (po trim) i oczyszczoną.
 function secretCandidates(raw) {
-  return [...new Set([typeof raw === 'string' ? raw.trim() : undefined, cleanEnv(raw)].filter(Boolean))];
+  const trimmed = typeof raw === 'string' ? raw.trim() : undefined;
+  return [trimmed, cleanEnv(raw)].filter(Boolean);
 }
 
 export function isAuthorizedCron(req, rawSecret = process.env.CRON_SECRET) {

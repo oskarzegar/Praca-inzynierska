@@ -10,22 +10,32 @@ import cronRouter  from './routes/cron.js';
 import { swaggerSpec } from './swagger.js';
 import { startSanctionSweep } from './lib/sanctionSweep.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
+
+// Lekki zestaw nagłówków bezpieczeństwa bez dodatkowych zależności (helmet wymagałby
+// konfiguracji CSP pod CDN-y: esm.sh, fonts, image.tmdb.org, YouTube).
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options':        'SAMEORIGIN',
+  'Referrer-Policy':        'strict-origin-when-cross-origin',
+  'X-DNS-Prefetch-Control': 'off',
+};
+
+// „Ładne" adresy podstron → pliki HTML z public/
+const PAGES = {
+  '/film/:slug':     'details.html',     // szczegóły filmu: /film/tytul-rok-id
+  '/category/:slug': 'movieList.html',   // lista gatunku: /category/thriller-53
+  '/admin':          'admin.html',       // panel administratora / moderacji
+};
+
 const app = express();
 
-// Za reverse-proxy (Render/Heroku itp.) req.ip ma być realnym adresem klienta
-// z X-Forwarded-For, a nie adresem proxy — ważne dla rate limitera proxy TMDB.
+// Za reverse-proxy req.ip ma być realnym adresem klienta z X-Forwarded-For,
+// a nie adresem proxy — ważne dla limiterów zapytań.
 app.set('trust proxy', 1);
 
-// ── Nagłówki bezpieczeństwa ─────────────────────────────────────────────────
-// Lekki zestaw bez dodatkowych zależności (helmet wymagałby konfiguracji CSP pod
-// CDN-y: esm.sh, fonts, image.tmdb.org, YouTube). Te nagłówki są bezpieczne dla
-// architektury aplikacji i nie psują żadnej funkcjonalności.
 app.use((_req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  res.setHeader('X-DNS-Prefetch-Control', 'off');
+  res.set(SECURITY_HEADERS);
   next();
 });
 
@@ -34,12 +44,10 @@ app.use(express.json());
 // Proxy do TMDB API – klucz API nigdy nie trafia do przeglądarki
 app.use('/api/tmdb', tmdbRouter);
 
-// Dokumentacja Swagger UI
+// Dokumentacja Swagger UI + specyfikacja OpenAPI jako JSON (Postman/narzędzia zewnętrzne)
 app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
   customSiteTitle: 'Projekt Filmy – API Docs',
 }));
-
-// Specyfikacja OpenAPI jako JSON (dla Postman/narzędzi zewnętrznych)
 app.get('/api/openapi.json', (_req, res) => res.json(swaggerSpec));
 
 // Panel administratora / moderacji – RBAC egzekwowane po stronie serwera
@@ -51,23 +59,12 @@ app.use('/api/cron', cronRouter);
 // REST API
 app.use('/api', apiRouter);
 
-// Strona szczegółów filmu: /film/tytul-rok-id
-app.get('/film/:slug', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'details.html'));
-});
+for (const [route, file] of Object.entries(PAGES)) {
+  app.get(route, (_req, res) => res.sendFile(path.join(PUBLIC_DIR, file)));
+}
 
-// Lista filmów według gatunku: /category/thriller-53
-app.get('/category/:slug', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'movieList.html'));
-});
-
-// Panel administratora / moderacji
-app.get('/admin', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
-});
-
-// Serwowanie plików frontendu
-app.use(express.static(path.join(__dirname, 'public')));
+// Pozostałe pliki frontendu
+app.use(express.static(PUBLIC_DIR));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

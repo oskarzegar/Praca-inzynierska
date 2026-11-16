@@ -1,56 +1,85 @@
-'use strict';
-
 // ============================================================================
 // routes/admin.js  –  Panel administratora i moderacji (WF-15..WF-18)
 //
-// Egzekwuje kontrolę dostępu opartą na rolach PO STRONIE SERWERA (wymaganie
-// niefunkcjonalne: RBAC nie może opierać się wyłącznie na interfejsie).
-//
-// Tożsamość żądającego jest weryfikowana na podstawie tokenu JWT Supabase,
-// a jego rola odczytywana z tabeli profiles. Operacje na danych wykonuje klucz
-// service_role (omija RLS), ale dopiero PO sprawdzeniu uprawnień w middleware.
-// Reguły hierarchii ról (kogo wolno ukarać) wymusza dodatkowo baza w funkcjach
-// set_account_status / set_user_role (obrona w głąb).
+// RBAC egzekwowany PO STRONIE SERWERA: tożsamość z tokenu JWT Supabase, rola
+// z tabeli profiles. Operacje panelu na danych wykonuje klucz service_role (omija RLS)
+// dopiero PO sprawdzeniu uprawnień w middleware; wyjątkiem jest sweep wygasłych kar,
+// który działa przed RBAC (zob. niżej). Zmiany statusu i roli idą tokenem moderatora
+// (RPC), a hierarchię ról (kogo wolno ukarać) wymusza baza w set_account_status /
+// set_user_role (obrona w głąb).
 // ============================================================================
 
 import { Router } from 'express';
 import {
-  SB_URL, SB_SERVICE,
-  verifyAuthToken, bearerToken, sbAdmin, sbRpcAsUser,
+  SB_SERVICE,
+  verifyAuthToken, bearerToken, sbAdmin, sbRpcAsUser, setAuthBan,
 } from '../lib/supabaseRest.js';
 import { maybeSweepSanctions } from '../lib/sanctionSweep.js';
 
 const router = Router();
 
-// ── Operacje specyficzne dla panelu (reszta helperów w lib/supabaseRest.js) ──
+const TOKEN_INVALID    = { error: 'Nieprawidłowy lub wygasły token', code: 'token_invalid' };
+const ACCOUNT_STATUSES = ['active', 'muted', 'blocked'];
+const ROLES            = ['user', 'moderator', 'admin'];
+const PERMANENT_BAN    = '876000h';   // ~100 lat — blokada „na stałe"
 
-// Ustawia czas blokady logowania w warstwie auth (Supabase Admin API).
-// banDuration: czas trwania Go (np. '300s', '876000h') lub 'none' (odblokowanie).
-async function setAuthBan(userId, banDuration) {
-  await fetch(`${SB_URL}/auth/v1/admin/users/${userId}`, {
-    method: 'PUT',
-    headers: {
-      apikey:        SB_SERVICE,
-      Authorization: `Bearer ${SB_SERVICE}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ ban_duration: banDuration }),
-  });
+// ── Pomocniki ───────────────────────────────────────────────────────────────
+
+function logModeration(entry) {
+  return sbAdmin('POST', 'moderation_log', entry);
 }
 
-// Mapuje błąd RPC wykonanego tokenem użytkownika na odpowiedź HTTP.
-// PostgREST zwraca 401 („JWT expired"), gdy token wygaśnie między weryfikacją
-// w middleware a wywołaniem RPC — klient wtedy odświeża sesję i ponawia żądanie.
+// Czas blokady logowania (format Go) dla nowego statusu; null = warstwa auth bez zmian.
+// Nietypowe `until` może rzucić wyjątek — wywoływać wewnątrz try.
+function authBanFor(status, until) {
+  if (status === 'active') return 'none';
+  if (status !== 'blocked') return null;
+  if (!until) return PERMANENT_BAN;
+  return `${Math.max(1, Math.ceil((new Date(until).getTime() - Date.now()) / 1000))}s`;
+}
+
+// Błąd RPC wykonanego tokenem użytkownika → odpowiedź HTTP. PostgREST zwraca 401
+// („JWT expired"), gdy token wygaśnie między middleware a RPC — klient wtedy
+// odświeża sesję i ponawia żądanie.
 function sendRpcError(res, rpc, fallback) {
-  if (rpc.status === 401) {
-    return res.status(401).json({ error: 'Nieprawidłowy lub wygasły token', code: 'token_invalid' });
-  }
+  if (rpc.status === 401) return res.status(401).json(TOKEN_INVALID);
   return res.status(rpc.status === 403 ? 403 : 400).json({ error: rpc.body?.message || fallback });
+}
+
+// Błąd zapytania service_role → status z Supabase (lub 500) + komunikat trasy.
+function sendAdminError(res, err, message) {
+  return res.status(err.status || 500).json({ error: message });
+}
+
+// Rola z tabeli profiles (brak wiersza → 'user'); null = błąd zapytania.
+async function fetchRole(userId) {
+  try {
+    const rows = await sbAdmin('GET', `profiles?id=eq.${userId}&select=role,account_status`);
+    return rows?.[0]?.role || 'user';
+  } catch {
+    return null;
+  }
+}
+
+// Usunięcie treści (recenzja / komentarz): 404 gdy nie istnieje, wpis w dzienniku moderacji.
+function removeContentRoute({ table, notFoundMessage, failureMessage, logEntry }) {
+  return async (req, res) => {
+    try {
+      const rows = await sbAdmin('GET', `${table}?id=eq.${req.params.id}&select=user_id`);
+      if (!rows.length) return res.status(404).json({ error: notFoundMessage });
+
+      await sbAdmin('DELETE', `${table}?id=eq.${req.params.id}`);
+      await logModeration(logEntry(req, rows[0].user_id));
+      res.json({ ok: true });
+    } catch (err) {
+      sendAdminError(res, err, failureMessage);
+    }
+  };
 }
 
 // ── Middleware RBAC ─────────────────────────────────────────────────────────
 
-// Wymaga konfiguracji klucza service_role – bez niego panel jest niedostępny.
+// Bez klucza service_role panel jest niedostępny.
 function requireServiceKey(_req, res, next) {
   if (!SB_SERVICE) {
     return res.status(503).json({ error: 'Panel administracyjny nie jest skonfigurowany (brak SUPABASE_SERVICE_ROLE_KEY).' });
@@ -58,35 +87,26 @@ function requireServiceKey(_req, res, next) {
   next();
 }
 
-// Zwraca middleware dopuszczające wyłącznie wskazane role.
+// Middleware dopuszczające wyłącznie wskazane role.
 function requireRole(allowedRoles) {
   return async (req, res, next) => {
     const token = bearerToken(req);
     if (!token) return res.status(401).json({ error: 'Brak tokenu autoryzacji', code: 'token_missing' });
 
+    // Odrzucony token → 401 (klient odświeża sesję i ponawia); błąd konfiguracji
+    // lub sieci serwera → 503 — to NIE jest wina sesji użytkownika.
     const { user, reason } = await verifyAuthToken(token);
+    if (!user?.id && reason === 'invalid') return res.status(401).json(TOKEN_INVALID);
     if (!user?.id) {
-      // Odróżniamy odrzucony token (401 → klient odświeża sesję i ponawia) od błędu
-      // konfiguracji/sieci serwera (503) — to drugie NIE jest winą sesji użytkownika.
-      if (reason === 'invalid') {
-        return res.status(401).json({ error: 'Nieprawidłowy lub wygasły token', code: 'token_invalid' });
-      }
       return res.status(503).json({
         error: 'Serwer nie może zweryfikować sesji (sprawdź SUPABASE_URL i SUPABASE_ANON_KEY na serwerze).',
         code:  'auth_unavailable',
       });
     }
 
-    let rows;
-    try {
-      rows = await sbAdmin('GET', `profiles?id=eq.${user.id}&select=role,account_status`);
-    } catch {
-      return res.status(500).json({ error: 'Błąd weryfikacji uprawnień' });
-    }
-    const role = rows?.[0]?.role || 'user';
-    if (!allowedRoles.includes(role)) {
-      return res.status(403).json({ error: 'Brak wymaganych uprawnień' });
-    }
+    const role = await fetchRole(user.id);
+    if (role === null) return res.status(500).json({ error: 'Błąd weryfikacji uprawnień' });
+    if (!allowedRoles.includes(role)) return res.status(403).json({ error: 'Brak wymaganych uprawnień' });
 
     req.authUser  = user;
     req.authToken = token;
@@ -98,7 +118,7 @@ function requireRole(allowedRoles) {
 router.use(requireServiceKey);
 
 // Na Vercel (serverless) nie ma stałego procesu z setInterval — wygasłe kary czyścimy
-// „przy okazji" ruchu w panelu (maks. raz na minutę na instancję), zanim panel
+// „przy okazji" ruchu w panelu (maks. raz na ~minutę na instancję), zanim panel
 // odczyta statusy kont. Błąd sweepa nigdy nie blokuje żądania.
 router.use(async (_req, _res, next) => {
   await maybeSweepSanctions();
@@ -108,78 +128,78 @@ router.use(async (_req, _res, next) => {
 const requireModerator = requireRole(['moderator', 'admin']);
 const requireAdmin     = requireRole(['admin']);
 
-// ── 1. GET /api/admin/me – rola i status zalogowanego (guard panelu) ─────────
+// ── 1. GET /api/admin/me – rola zalogowanego (guard panelu) ──────────────────
 router.get('/me', requireModerator, (req, res) => {
   res.json({ id: req.authUser.id, role: req.authRole });
 });
 
 // ── 2. GET /api/admin/feed – ostatnio dodane recenzje i komentarze ───────────
+const FEED_REVIEW_COLUMNS  = 'id,movie_id,movie_title,review_text,is_spoiler,created_at,user_id,profiles(display_name,avatar_url,role,account_status)';
+const FEED_COMMENT_COLUMNS = 'id,body,created_at,user_id,review_id,profiles(display_name,avatar_url)';
+
+// ?limit=… (tu oraz w /log i /users): 0 / NaN → wartość domyślna, ograniczenie tylko
+// z góry — wartość ujemna trafia do PostgREST bez zmian.
 router.get('/feed', requireModerator, async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 20, 50);
   try {
     const [reviews, comments] = await Promise.all([
-      sbAdmin('GET', `reviews?select=id,movie_id,movie_title,review_text,is_spoiler,created_at,user_id,profiles(display_name,avatar_url,role,account_status)&order=created_at.desc&limit=${limit}`),
-      sbAdmin('GET', `review_comments?select=id,body,created_at,user_id,review_id,profiles(display_name,avatar_url)&order=created_at.desc&limit=${limit}`),
+      sbAdmin('GET', `reviews?select=${FEED_REVIEW_COLUMNS}&order=created_at.desc&limit=${limit}`),
+      sbAdmin('GET', `review_comments?select=${FEED_COMMENT_COLUMNS}&order=created_at.desc&limit=${limit}`),
     ]);
     res.json({ reviews, comments });
   } catch (err) {
-    res.status(err.status || 500).json({ error: 'Błąd pobierania treści do moderacji' });
+    sendAdminError(res, err, 'Błąd pobierania treści do moderacji');
   }
 });
 
 // ── 2b. GET /api/admin/log – dziennik działań moderacji ──────────────────────
+const LOG_COLUMNS = 'id,action,reason,created_at,target_review_id,'
+  + 'moderator:profiles!moderator_id(id,display_name),'
+  + 'target:profiles!target_user_id(id,display_name)';
+
 router.get('/log', requireModerator, async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 80, 200);
   try {
-    const rows = await sbAdmin('GET',
-      'moderation_log?select=id,action,reason,created_at,target_review_id,' +
-      'moderator:profiles!moderator_id(id,display_name),' +
-      'target:profiles!target_user_id(id,display_name)' +
-      `&order=created_at.desc&limit=${limit}`);
-    res.json(rows);
+    res.json(await sbAdmin('GET', `moderation_log?select=${LOG_COLUMNS}&order=created_at.desc&limit=${limit}`));
   } catch (err) {
-    res.status(err.status || 500).json({ error: 'Błąd pobierania dziennika moderacji' });
+    sendAdminError(res, err, 'Błąd pobierania dziennika moderacji');
   }
 });
 
 // ── 3. GET /api/admin/users – lista/wyszukiwanie kont ────────────────────────
+const USER_COLUMNS = 'id,display_name,email,avatar_url,role,account_status,muted_until,created_at';
+
 router.get('/users', requireModerator, async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 30, 100);
   const q     = (req.query.query || '').trim();
-  let path = `profiles?select=id,display_name,email,avatar_url,role,account_status,muted_until,created_at&order=created_at.desc&limit=${limit}`;
-  // Usuń znaki strukturalne PostgREST, których encodeURIComponent NIE koduje — bez tego
-  // nawiasy/gwiazdki z wejścia mogłyby zmienić składnię filtra or=(...).
-  const safe = q.replace(/[(),*]/g, ' ').trim();
-  if (safe) {
-    const enc = encodeURIComponent(`*${safe}*`);
-    path += `&or=(display_name.ilike.${enc},email.ilike.${enc})`;
+  // Znaki składni filtra PostgREST or=(…) — nawiasy, przecinek i gwiazdka (wildcard
+  // ilike) — są zamieniane na spacje, by wejście nie zmieniło struktury filtra.
+  const search = q.replace(/[(),*]/g, ' ').trim();
+  let path = `profiles?select=${USER_COLUMNS}&order=created_at.desc&limit=${limit}`;
+  if (search) {
+    const pattern = encodeURIComponent(`*${search}*`);
+    path += `&or=(display_name.ilike.${pattern},email.ilike.${pattern})`;
   }
   try {
     res.json(await sbAdmin('GET', path));
   } catch (err) {
-    res.status(err.status || 500).json({ error: 'Błąd pobierania użytkowników' });
+    sendAdminError(res, err, 'Błąd pobierania użytkowników');
   }
 });
 
 // ── 4. DELETE /api/admin/reviews/:id – usunięcie cudzej recenzji ─────────────
-router.delete('/reviews/:id', requireModerator, async (req, res) => {
-  try {
-    const deleted = await sbAdmin('GET', `reviews?id=eq.${req.params.id}&select=user_id`);
-    if (!deleted.length) return res.status(404).json({ error: 'Recenzja nie istnieje' });
-
-    await sbAdmin('DELETE', `reviews?id=eq.${req.params.id}`);
-    await sbAdmin('POST', 'moderation_log', {
-      moderator_id:     req.authUser.id,
-      target_user_id:   deleted[0].user_id,
-      target_review_id: req.params.id,
-      action:           'review:delete',
-      reason:           req.body?.reason || null,
-    });
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(err.status || 500).json({ error: 'Błąd usuwania recenzji' });
-  }
-});
+router.delete('/reviews/:id', requireModerator, removeContentRoute({
+  table:           'reviews',
+  notFoundMessage: 'Recenzja nie istnieje',
+  failureMessage:  'Błąd usuwania recenzji',
+  logEntry: (req, targetUserId) => ({
+    moderator_id:     req.authUser.id,
+    target_user_id:   targetUserId,
+    target_review_id: req.params.id,
+    action:           'review:delete',
+    reason:           req.body?.reason || null,
+  }),
+}));
 
 // ── 5. PATCH /api/admin/reviews/:id/spoiler – wymuszenie/zdjęcie flagi ───────
 router.patch('/reviews/:id/spoiler', requireModerator, async (req, res) => {
@@ -188,7 +208,7 @@ router.patch('/reviews/:id/spoiler', requireModerator, async (req, res) => {
     const updated = await sbAdmin('PATCH', `reviews?id=eq.${req.params.id}`, { is_spoiler: isSpoiler });
     if (!updated.length) return res.status(404).json({ error: 'Recenzja nie istnieje' });
 
-    await sbAdmin('POST', 'moderation_log', {
+    await logModeration({
       moderator_id:     req.authUser.id,
       target_user_id:   updated[0].user_id,
       target_review_id: req.params.id,
@@ -196,36 +216,28 @@ router.patch('/reviews/:id/spoiler', requireModerator, async (req, res) => {
     });
     res.json({ ok: true, is_spoiler: isSpoiler });
   } catch (err) {
-    res.status(err.status || 500).json({ error: 'Błąd zmiany flagi spoilera' });
+    sendAdminError(res, err, 'Błąd zmiany flagi spoilera');
   }
 });
 
 // ── 6. DELETE /api/admin/comments/:id – usunięcie cudzego komentarza ─────────
-router.delete('/comments/:id', requireModerator, async (req, res) => {
-  try {
-    const found = await sbAdmin('GET', `review_comments?id=eq.${req.params.id}&select=user_id`);
-    if (!found.length) return res.status(404).json({ error: 'Komentarz nie istnieje' });
-
-    await sbAdmin('DELETE', `review_comments?id=eq.${req.params.id}`);
-    await sbAdmin('POST', 'moderation_log', {
-      moderator_id:   req.authUser.id,
-      target_user_id: found[0].user_id,
-      action:         'comment:delete',
-      reason:         req.body?.reason || null,
-    });
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(err.status || 500).json({ error: 'Błąd usuwania komentarza' });
-  }
-});
+router.delete('/comments/:id', requireModerator, removeContentRoute({
+  table:           'review_comments',
+  notFoundMessage: 'Komentarz nie istnieje',
+  failureMessage:  'Błąd usuwania komentarza',
+  logEntry: (req, targetUserId) => ({
+    moderator_id:   req.authUser.id,
+    target_user_id: targetUserId,
+    action:         'comment:delete',
+    reason:         req.body?.reason || null,
+  }),
+}));
 
 // ── 7. PATCH /api/admin/users/:id/status – wycisz / zablokuj / przywróć ──────
-// Reguły hierarchii ról egzekwuje RPC set_account_status (auth.uid() = moderator).
+// Hierarchię ról egzekwuje RPC set_account_status (auth.uid() = moderator).
 router.patch('/users/:id/status', requireModerator, async (req, res) => {
   const { status, reason, until } = req.body || {};   // until: ISO string lub null (permanentnie)
-  if (!['active', 'muted', 'blocked'].includes(status)) {
-    return res.status(400).json({ error: 'Nieprawidłowy status konta' });
-  }
+  if (!ACCOUNT_STATUSES.includes(status)) return res.status(400).json({ error: 'Nieprawidłowy status konta' });
 
   const rpc = await sbRpcAsUser(req.authToken, 'set_account_status', {
     p_target:      req.params.id,
@@ -233,37 +245,24 @@ router.patch('/users/:id/status', requireModerator, async (req, res) => {
     p_reason:      reason || null,
     p_muted_until: until || null,
   });
-
   if (!rpc.ok) return sendRpcError(res, rpc, 'Nie udało się zmienić statusu konta');
 
-  // Blokada logowania w warstwie auth – z czasem trwania (lub permanentnie / odblokowanie).
+  // Blokada logowania w warstwie auth: czasowa, permanentna albo zdjęcie blokady
   try {
-    if (status === 'blocked') {
-      const banDuration = until
-        ? `${Math.max(1, Math.ceil((new Date(until).getTime() - Date.now()) / 1000))}s`
-        : '876000h';
-      await setAuthBan(req.params.id, banDuration);
-    }
-    if (status === 'active') await setAuthBan(req.params.id, 'none');
+    const banDuration = authBanFor(status, until);
+    if (banDuration) await setAuthBan(req.params.id, banDuration);
   } catch {
     return res.status(500).json({ error: 'Status zapisany, ale blokada logowania nie powiodła się' });
   }
-
   res.json({ ok: true, status });
 });
 
 // ── 8. PATCH /api/admin/users/:id/role – zmiana roli (tylko Admin) ───────────
 router.patch('/users/:id/role', requireAdmin, async (req, res) => {
   const { role } = req.body || {};
-  if (!['user', 'moderator', 'admin'].includes(role)) {
-    return res.status(400).json({ error: 'Nieprawidłowa rola' });
-  }
+  if (!ROLES.includes(role)) return res.status(400).json({ error: 'Nieprawidłowa rola' });
 
-  const rpc = await sbRpcAsUser(req.authToken, 'set_user_role', {
-    p_target: req.params.id,
-    p_role:   role,
-  });
-
+  const rpc = await sbRpcAsUser(req.authToken, 'set_user_role', { p_target: req.params.id, p_role: role });
   if (!rpc.ok) return sendRpcError(res, rpc, 'Nie udało się zmienić roli');
   res.json({ ok: true, role });
 });
