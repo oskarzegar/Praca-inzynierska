@@ -21,25 +21,6 @@ export function search() {
   const headerSearchField = document.querySelector("[search-field]");
   const searchBox         = document.querySelector("[search-box]");
 
-  // ─── Przycisk filtrów w nagłówku (otwiera modal z rozwiniętymi filtrami) ──────
-
-  const filterBtn = document.createElement("button");
-  filterBtn.className = "filter-open-btn";
-  filterBtn.setAttribute("aria-label", "Filtry zaawansowane");
-  filterBtn.setAttribute("title", "Filtry zaawansowane");
-  filterBtn.innerHTML = `
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none"
-         xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-      <line x1="4" y1="6"  x2="20" y2="6"  stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-      <circle cx="15" cy="6"  r="2.5" fill="var(--background)" stroke="currentColor" stroke-width="2"/>
-      <line x1="4" y1="12" x2="20" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-      <circle cx="9"  cy="12" r="2.5" fill="var(--background)" stroke="currentColor" stroke-width="2"/>
-      <line x1="4" y1="18" x2="20" y2="18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-      <circle cx="14" cy="18" r="2.5" fill="var(--background)" stroke="currentColor" stroke-width="2"/>
-    </svg>
-  `;
-  searchBox.querySelector("[search-wrapper]").appendChild(filterBtn);
-
   // ─── Modal wyszukiwania ────────────────────────────────────────────────────────
 
   const searchModal = document.createElement("div");
@@ -58,25 +39,12 @@ export function search() {
           autocomplete="off"
         />
       </div>
-      <button class="adv-filters-toggle" id="adv-filters-toggle"
-              aria-label="Pokaż filtry" aria-expanded="false">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none"
-             xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <line x1="4" y1="6"  x2="20" y2="6"  stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-          <circle cx="15" cy="6"  r="2.5" fill="currentColor" stroke="currentColor" stroke-width="2"/>
-          <line x1="4" y1="12" x2="20" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-          <circle cx="9"  cy="12" r="2.5" fill="currentColor" stroke="currentColor" stroke-width="2"/>
-          <line x1="4" y1="18" x2="20" y2="18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-          <circle cx="14" cy="18" r="2.5" fill="currentColor" stroke="currentColor" stroke-width="2"/>
-        </svg>
-        Filtry
-      </button>
       <button class="adv-close-btn" id="adv-close-btn" aria-label="Zamknij wyszukiwanie">
         <img src="./assets/imgs/close.svg" width="20" height="20" alt="Zamknij" />
       </button>
     </div>
 
-    <div class="adv-filters-panel" id="adv-filters-panel" hidden>
+    <div class="adv-filters-panel" id="adv-filters-panel">
       <div class="filter-row">
         <div class="filter-field">
           <label class="filter-label">Rok (od – do)</label>
@@ -188,8 +156,6 @@ export function search() {
   const popularSection   = searchModal.querySelector("#adv-popular-section");
   const resultsPanel     = searchModal.querySelector("#adv-results-panel");
   const popularGrid      = searchModal.querySelector("#adv-popular-grid");
-  const filtersPanel     = searchModal.querySelector("#adv-filters-panel");
-  const filtersToggleBtn = searchModal.querySelector("#adv-filters-toggle");
 
   const getVal            = (id) => searchModal.querySelector(`#${id}`).value.trim();
   const isBadInput        = (id) => Boolean(searchModal.querySelector(`#${id}`).validity?.badInput);
@@ -209,24 +175,6 @@ export function search() {
   const num = (v) => (v ? Number(v) : 0);
   const COMMUNITY_PAGE_SIZE = 20;
   let communityCache = [];
-
-  // ── Pokaż / ukryj panel filtrów ─────────────────────────────────────────────
-
-  function showFilters() {
-    filtersPanel.hidden = false;
-    filtersToggleBtn.classList.add("active");
-    filtersToggleBtn.setAttribute("aria-expanded", "true");
-  }
-
-  function hideFilters() {
-    filtersPanel.hidden = true;
-    filtersToggleBtn.classList.remove("active");
-    filtersToggleBtn.setAttribute("aria-expanded", "false");
-  }
-
-  filtersToggleBtn.addEventListener("click", () => {
-    filtersPanel.hidden ? showFilters() : hideFilters();
-  });
 
   // ── Compact / expanded ──────────────────────────────────────────────────────
 
@@ -270,12 +218,22 @@ export function search() {
     }
   };
 
-  const openModal = (withFilters = false) => {
+  const openModal = () => {
+    if (searchModal.classList.contains("active")) return;
     setLupaExpanded(true);
     searchModal.classList.add("active");
     searchModal.style.visibility = "visible";
-    if (withFilters) showFilters();
+    // Fraza wpisana już w polu nagłówka (np. autouzupełnienie) przechodzi do okna
+    const pending = headerSearchField.value.trim();
+    if (pending && !advQueryField.value.trim()) { advQueryField.value = pending; scheduleSearch(); }
+    // Okno pojawia się z przejściem CSS (visibility z opóźnieniem) — pole, które jest
+    // jeszcze niewidoczne, nie przyjmuje fokusu, więc ponawiamy po zakończeniu przejścia
     advQueryField.focus();
+    setTimeout(() => {
+      if (searchModal.classList.contains("active") && document.activeElement !== advQueryField) {
+        advQueryField.focus({ preventScroll: true });
+      }
+    }, 250);
     searchBox.style.display = "none";
     loadPopular();
   };
@@ -289,27 +247,20 @@ export function search() {
     headerSearchField.value = "";
   };
 
-  // Pisanie w nagłówkowym polu otwiera modal i przenosi zapytanie
-  headerSearchField.addEventListener("input", function () {
-    const q = this.value.trim();
-    if (!q) return;
-    openModal();
-    advQueryField.value = q;
-    scheduleSearch();
-  });
+  // Pole wyszukiwania w nagłówku (desktop): kliknięcie lub fokus z klawiatury od razu
+  // otwiera okno wyszukiwania z widocznymi filtrami — bez etapu „zwykłego" pola.
+  headerSearchField.addEventListener("focus", openModal);
+  headerSearchField.addEventListener("click", openModal);
+  headerSearchField.addEventListener("input", openModal);   // np. autouzupełnienie przeglądarki
 
-  // Przycisk filtrów w nagłówku otwiera modal z rozwiniętym panelem filtrów
-  filterBtn.addEventListener("click", () => openModal(true));
-
-  // Lupa w nagłówku PRZEŁĄCZA zaawansowane wyszukiwanie: pierwsze kliknięcie otwiera,
-  // kolejne zamyka. Wcześniej zawsze wołała openModal, więc ponowne kliknięcie nie
-  // zamykało okna (a global.js przełączał w tle ukryty search-box).
+  // Lupa w nagłówku (mobile) przełącza to samo okno: pierwsze kliknięcie otwiera,
+  // kolejne zamyka.
   for (const lupa of document.querySelectorAll(".header .search-btn[menu-close]")) {
     lupa.setAttribute("aria-expanded", "false");
     lupa.setAttribute("aria-label", "Wyszukiwanie");
     lupa.addEventListener("click", () => {
       if (searchModal.classList.contains("active")) closeModal();
-      else openModal(true);
+      else openModal();
     });
   }
 

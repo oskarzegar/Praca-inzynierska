@@ -32,6 +32,26 @@ function fmtDate(iso) {
 let myRole = null;
 let myId   = null;
 
+// Po zmianie roli strona jest przeładowywana (wszystkie widoki i uprawnienia
+// odczytane od nowa). Zakładka, wyszukiwana fraza i komunikat przechodzą przez
+// sessionStorage, żeby admin wrócił dokładnie w to samo miejsce.
+const FLASH_KEY = 'adminFlash';
+
+function reloadWithFlash(flash) {
+  try { sessionStorage.setItem(FLASH_KEY, JSON.stringify(flash)); } catch { /* brak storage — sam reload */ }
+  window.location.reload();
+}
+
+function takeFlash() {
+  try {
+    const raw = sessionStorage.getItem(FLASH_KEY);
+    sessionStorage.removeItem(FLASH_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
 // ── Inicjalizacja + guard dostępu ───────────────────────────────────────────
 async function init() {
   pageContent.innerHTML = '<p class="results-loading">Sprawdzanie uprawnień…</p>';
@@ -59,7 +79,20 @@ async function init() {
 
   renderShell();
   loadFeed();
+
+  // Powrót po przeładowaniu (np. po zmianie roli) — otwórz zakładkę Użytkownicy.
+  // init() bywa wołane kilka razy tuż po starcie (onAuthStateChange), dlatego flash
+  // odczytany raz przy ładowaniu modułu obowiązuje przez kilka pierwszych sekund.
+  const flash = Date.now() - STARTED_AT < 8000 ? STARTUP_FLASH : null;
+  if (flash?.tab === 'users') {
+    pendingUsersFlash = flash;
+    pageContent.querySelector('.admin-tab[data-tab="users"]')?.click();
+  }
 }
+
+let pendingUsersFlash = null;
+const STARTED_AT    = Date.now();
+const STARTUP_FLASH = takeFlash();
 
 function renderShell() {
   pageContent.innerHTML = `
@@ -205,7 +238,17 @@ function renderUsersPanel() {
   section.querySelector('#admin-user-search-btn').addEventListener('click', runSearch);
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') runSearch(); });
 
-  loadUsers('');
+  const flash = pendingUsersFlash;
+  pendingUsersFlash = null;
+  if (flash?.msg) {
+    const note = document.createElement('p');
+    note.className = 'mod-panel-msg mod-panel-msg--ok admin-flash';
+    note.setAttribute('role', 'status');
+    note.textContent = flash.msg;
+    section.insertBefore(note, section.querySelector('#admin-user-list'));
+  }
+  input.value = flash?.query || '';
+  loadUsers(input.value.trim());
 }
 
 async function loadUsers(query) {
@@ -273,8 +316,16 @@ function buildUserRow(u) {
       e.currentTarget.disabled = true;
       const res = await adminFetch(`/users/${u.id}/role`, { method: 'PATCH', body: { role } });
       e.currentTarget.disabled = false;
-      if (res.ok) { setMsg(`Rola zmieniona na: ${ROLE_LABEL[role]}.`, true); u.role = role; }
-      else setMsg(res.data?.error || 'Błąd zmiany roli.');
+      if (res.ok) {
+        setMsg(`Rola zmieniona na: ${ROLE_LABEL[role]}. Odświeżanie…`, true);
+        reloadWithFlash({
+          tab:   'users',
+          query: pageContent.querySelector('#admin-user-query')?.value.trim() || '',
+          msg:   `Rola konta ${u.display_name || u.email || ''} zmieniona na: ${ROLE_LABEL[role]}.`,
+        });
+      } else {
+        setMsg(res.data?.error || 'Błąd zmiany roli.');
+      }
     });
     actions.appendChild(wrap);
   }

@@ -872,31 +872,6 @@ body {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   FILTER OPEN BUTTON (header)
-   ───────────────────────────────────────────────────────────────────────────── */
-
-.filter-open-btn {
-  position: absolute;
-  right: 8px;
-  top: 50%;
-  transform: translateY(-50%);
-  padding: 8px;
-  color: var(--on-surface-variant);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition:
-    color var(--transition-short),
-    background var(--transition-short);
-  border-radius: var(--radius-8);
-}
-
-.filter-open-btn:is(:hover, :focus-visible) {
-  color: var(--on-surface);
-  background: rgba(255, 255, 255, 0.06);
-}
-
-/* ─────────────────────────────────────────────────────────────────────────────
    QUICK RESULTS PANEL (simple text search)
    ───────────────────────────────────────────────────────────────────────────── */
 
@@ -1052,36 +1027,6 @@ body {
 .adv-close-btn:is(:hover, :focus-visible) {
   background: var(--surface);
   box-shadow: 0 0 0 2px var(--on-surface-variant);
-}
-
-.adv-filters-toggle {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  background: var(--backgroud-variant);
-  color: var(--on-surface-variant);
-  border-radius: var(--radius-8);
-  padding: 10px 14px;
-  font-size: var(--font-label);
-  font-weight: 500;
-  flex-shrink: 0;
-  white-space: nowrap;
-  transition: var(--transition-short);
-}
-
-.adv-filters-toggle:is(:hover, :focus-visible) {
-  color: var(--on-surface);
-  box-shadow: 0 0 0 2px var(--on-surface-variant);
-}
-
-.adv-filters-toggle.active {
-  background: var(--primary);
-  color: var(--white);
-}
-
-.adv-filters-toggle.active:is(:hover, :focus-visible) {
-  background: var(--primary-variant);
-  box-shadow: none;
 }
 
 /* --- filters panel --- */

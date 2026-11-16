@@ -12,6 +12,16 @@ import { supabase }            from './supabase.js';
 import { getCurrentRole, isModerator, adminFetch } from './rbac.js';
 import { promptReason }        from './dialog.js';
 
+// Komunikat po przeładowaniu strony (zmiana roli na profilu) — odczytywany raz
+const STARTED_AT    = Date.now();
+const STARTUP_FLASH = (() => {
+  try {
+    const raw = sessionStorage.getItem('profileModFlash');
+    sessionStorage.removeItem('profileModFlash');
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+})();
+
 const STATUS_LABEL = { active: 'Aktywne', muted: 'Wyciszone', blocked: 'Zablokowane' };
 const ROLE_LABEL   = { user: 'Użytkownik', moderator: 'Moderator', admin: 'Administrator' };
 
@@ -142,6 +152,10 @@ export async function initProfileModeration(profileId, displayName, mountEl) {
     msg.className = `mod-panel-msg ${ok ? 'mod-panel-msg--ok' : 'mod-panel-msg--err'}`;
   };
 
+  // Komunikat zapisany przed przeładowaniem strony (zmiana roli) — ważny przez kilka
+  // pierwszych sekund (panel może się wyrenderować kilka razy przy starcie strony)
+  if (STARTUP_FLASH?.profileId === profileId && Date.now() - STARTED_AT < 8000) setMsg(STARTUP_FLASH.msg, true);
+
   // Zmiana statusu konta
   for (const btn of mountEl.querySelectorAll('[data-act]')) {
     btn.addEventListener('click', async () => {
@@ -183,8 +197,12 @@ export async function initProfileModeration(profileId, displayName, mountEl) {
         method: 'PATCH', body: { role: newRole },
       });
       if (ok) {
-        setMsg(`Rola zmieniona na: ${ROLE_LABEL[newRole]}.`, true);
-        initProfileModeration(profileId, displayName, mountEl);
+        // Przeładowanie odświeża całą stronę profilu (plakietka rangi, panel, uprawnienia)
+        setMsg(`Rola zmieniona na: ${ROLE_LABEL[newRole]}. Odświeżanie…`, true);
+        try {
+          sessionStorage.setItem('profileModFlash', JSON.stringify({ profileId, msg: `Rola zmieniona na: ${ROLE_LABEL[newRole]}.` }));
+        } catch { /* brak storage — sam reload */ }
+        window.location.reload();
       } else {
         roleSaveBtn.disabled = false;
         setMsg(data?.error || 'Nie udało się zmienić roli.');
