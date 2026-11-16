@@ -188,6 +188,7 @@ function renderMovieList(containerId, title, items) {
 
     const el = document.createElement('a');
     el.className = 'profile-movie-item';
+    el.dataset.movieId = item.movie_id;   // filtr wiekowy (ageGate.js) obejmuje też listy profili
     el.href = movieUrl(item.movie_id, item.movie_title);
     el.innerHTML = `
       <img src="${posterSrc}" alt="${escapeAttr(item.movie_title)}" loading="lazy" />

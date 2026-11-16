@@ -15,6 +15,8 @@ Skrypty są **idempotentne** (`if not exists`, `create or replace`,
 | `40_user_ranks.sql` | RPC `user_rank_info` – rola + suma pomocnych głosów dla zbioru kont (odznaki rang w UI). | WF-24 |
 | `50_sanction_duration.sql` | Kary czasowe: `set_account_status` zapisuje `muted_until` także dla `blocked`; `can_post()` auto-przywraca publikowanie po wygaśnięciu kary. | WF-16, WF-17 |
 | `60_self_sanction_visibility.sql` | Polityka RLS pozwalająca użytkownikowi czytać własne wpisy `moderation_log` (powód kary widoczny w banerze informacyjnym). | WF-16, WF-17 |
+| `80_age_restrictions.sql` | Kolumna `profiles.birth_date` **bez grantów kolumnowych** (prywatna — `profiles` jest czytelne publicznie); RPC `get_my_birth_date` / `set_my_birth_date` (tylko własne konto); trigger rejestracji zapisuje datę z `raw_user_meta_data`. Wymaga wcześniejszego `70`. | Filtr treści wg wieku |
+| `90_sanction_sweep.sql` | Funkcja `sweep_expired_sanctions()` (`account_status → 'active'`, `muted_until → NULL`, wpis w dzienniku; czas z `now()` bazy) dla backendu (service_role) + opcjonalny harmonogram **pg_cron co minutę** (włącz rozszerzenie pg_cron i uruchom skrypt ponownie). | WF-16, WF-17 |
 | `70_security_fixes.sql` | **KRYTYCZNE** — granty kolumnowe: `role`/`account_status`/`muted_until` niezapisywalne z przeglądarki (blokada eskalacji uprawnień i obejścia kar), `email` nieczytelny dla klienta (blokada wycieku), awatary tylko we własnym folderze. **Uruchom natychmiast.** | WF-15, WF-16 |
 
 ## Konfiguracja po stronie aplikacji

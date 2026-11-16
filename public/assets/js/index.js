@@ -6,6 +6,7 @@ import { createMovieCard } from "./movie-card.js";
 import { search } from "./search.js";
 import { supabase } from "./supabase.js";
 import { loadCommunityRatings } from "./communityRatings.js";
+import { filterAllowedMovies, getRatings, movieMinAge, isAllowed, onViewerChange } from "./ageGate.js";
 search();
 loadCommunityRatings();
 const pageContent = document.querySelector("[page-content]");
@@ -80,7 +81,35 @@ fetchData(`/api/tmdb/genre/movie/list?language=pl`, function ({ genres }) {
   fetchData(`/api/tmdb/movie/popular?language=pl`, heroBanner);
 });
 
-const heroBanner = function ({ results: movieList }) {
+const heroBanner = async function ({ results }) {
+  // Miejsce na baner rezerwujemy od razu (zachowuje kolejność sekcji), a pozostałe sekcje
+  // startują równolegle — nie czekają na sprawdzenie klasyfikacji wiekowych banera.
+  const bannerSlot = document.createElement('div');
+  pageContent.appendChild(bannerSlot);
+
+  // Placeholder rekomendacji tuż po hero — wypełniany przez loadRecommendations
+  recSection = document.createElement('section');
+  recSection.classList.add('movie-list');
+  recSection.style.display = 'none';
+  pageContent.appendChild(recSection);
+
+  // Pobiera filmy dla każdej sekcji; wywołania są niezależne, więc trafiają do sieci równolegle
+  for (const { title, path } of homePageSections) {
+    fetchData(`/api/tmdb${path}?language=pl&page=1`, createMovieList, title);
+  }
+
+  // Pierwsze załadowanie rekomendacji (onAuthStateChange mógł odpalić zanim banner był gotowy)
+  supabase.auth.getSession().then(({ data: { session } }) => loadRecommendations(session));
+
+  // Filtr wiekowy: w banerze tylko filmy dozwolone dla bieżącego widza (i z obrazem tła)
+  const movieList = (await filterAllowedMovies(results || [])).filter((m) => m.backdrop_path && m.title);
+
+  // Zmiana widza (np. wylogowanie) mogłaby odsłonić slajd niedozwolony — wtedy przeładuj
+  onViewerChange(async (viewer) => {
+    const ratings = await getRatings(movieList.map((m) => m.id));
+    if (movieList.some((m) => !isAllowed(movieMinAge(ratings.get(m.id), m.adult), viewer.age))) window.location.reload();
+  });
+
   const banner = document.createElement("section");
   banner.classList.add("banner");
   banner.ariaLabel = "Popular Movies";
@@ -104,14 +133,14 @@ const heroBanner = function ({ results: movieList }) {
       <div class="banner-content">
         <h2 class="heading">${title}</h2>
         <div class="meta-list">
-          <div class="meta-item">${release_date.split("-")[0]}</div>
-          <div class="meta-item card-badge">${vote_average.toFixed(1)}</div>
+          <div class="meta-item">${(release_date || "").split("-")[0]}</div>
+          <div class="meta-item card-badge">${Number(vote_average || 0).toFixed(1)}</div>
         </div>
         <p class="genre">${genreList.asString(genre_ids)}</p>
         <p class="banner-text">${overview}</p>
         <a href="${movieUrl(id, title, release_date)}" class="btn">
           <img src="./assets/imgs/play_circle.svg" width="24" height="24" aria-hidden="true" alt="play" />
-          <span class="span">Oglądnij teraz</span>
+          <span class="span">Obejrzyj teraz</span>
         </a>
       </div>`;
     banner.querySelector(".banner-slider").appendChild(sliderItem);
@@ -124,23 +153,13 @@ const heroBanner = function ({ results: movieList }) {
     controlItem.innerHTML = ` <img src="${imgBaseURL}w154${poster_path}" alt="Przesuń ${title}" loading="lazy" draggable="false" class="img-cover" />`;
     banner.querySelector(".control-inner").appendChild(controlItem);
   }
-  pageContent.appendChild(banner);
-  // Inicjalizuje obsługę kliknięć w miniaturki dopiero po dodaniu całego banera do DOM
-  addHeroSlide();
-
-  // Placeholder rekomendacji tuż po hero — wypełniany przez loadRecommendations
-  recSection = document.createElement('section');
-  recSection.classList.add('movie-list');
-  recSection.style.display = 'none';
-  pageContent.appendChild(recSection);
-
-  // Pobiera filmy dla każdej sekcji; wywołania są niezależne, więc trafiają do sieci równolegle
-  for (const { title, path } of homePageSections) {
-    fetchData(`/api/tmdb${path}?language=pl&page=1`, createMovieList, title);
+  if (movieList.length) {
+    bannerSlot.replaceWith(banner);
+    // Inicjalizuje obsługę kliknięć w miniaturki dopiero po dodaniu całego banera do DOM
+    addHeroSlide();
+  } else {
+    bannerSlot.remove();
   }
-
-  // Pierwsze załadowanie rekomendacji (onAuthStateChange mógł odpalić zanim banner był gotowy)
-  supabase.auth.getSession().then(({ data: { session } }) => loadRecommendations(session));
 };
 
 const addHeroSlide = function () {

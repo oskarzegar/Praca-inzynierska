@@ -6,6 +6,7 @@ import swaggerUi from 'swagger-ui-express';
 import tmdbRouter  from './routes/tmdb.js';
 import apiRouter   from './routes/api.js';
 import adminRouter from './routes/admin.js';
+import cronRouter  from './routes/cron.js';
 import { swaggerSpec } from './swagger.js';
 import { startSanctionSweep } from './lib/sanctionSweep.js';
 
@@ -44,6 +45,9 @@ app.get('/api/openapi.json', (_req, res) => res.json(swaggerSpec));
 // Panel administratora / moderacji – RBAC egzekwowane po stronie serwera
 app.use('/api/admin', adminRouter);
 
+// Zadania cykliczne (Vercel Cron, chronione CRON_SECRET) – np. zdejmowanie wygasłych kar
+app.use('/api/cron', cronRouter);
+
 // REST API
 app.use('/api', apiRouter);
 
@@ -69,6 +73,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Serwer działa na http://localhost:${PORT}`);
   console.log(`Dokumentacja API: http://localhost:${PORT}/api/docs`);
-  // Cykliczne czyszczenie wygasłych kar (account_status → 'active' w bazie)
+  // Cykliczne czyszczenie wygasłych kar (account_status → 'active', muted_until → NULL).
+  // Na Vercel pomijane — tam działa Vercel Cron (/api/cron/sweep-sanctions) i sweep leniwy.
   startSanctionSweep();
 });

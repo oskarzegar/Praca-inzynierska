@@ -16,8 +16,9 @@
 import { Router } from 'express';
 import {
   SB_URL, SB_SERVICE,
-  getAuthUser, sbAdmin, sbRpcAsUser,
+  verifyAuthToken, bearerToken, sbAdmin, sbRpcAsUser,
 } from '../lib/supabaseRest.js';
+import { maybeSweepSanctions } from '../lib/sanctionSweep.js';
 
 const router = Router();
 
@@ -37,6 +38,16 @@ async function setAuthBan(userId, banDuration) {
   });
 }
 
+// Mapuje błąd RPC wykonanego tokenem użytkownika na odpowiedź HTTP.
+// PostgREST zwraca 401 („JWT expired"), gdy token wygaśnie między weryfikacją
+// w middleware a wywołaniem RPC — klient wtedy odświeża sesję i ponawia żądanie.
+function sendRpcError(res, rpc, fallback) {
+  if (rpc.status === 401) {
+    return res.status(401).json({ error: 'Nieprawidłowy lub wygasły token', code: 'token_invalid' });
+  }
+  return res.status(rpc.status === 403 ? 403 : 400).json({ error: rpc.body?.message || fallback });
+}
+
 // ── Middleware RBAC ─────────────────────────────────────────────────────────
 
 // Wymaga konfiguracji klucza service_role – bez niego panel jest niedostępny.
@@ -50,11 +61,21 @@ function requireServiceKey(_req, res, next) {
 // Zwraca middleware dopuszczające wyłącznie wskazane role.
 function requireRole(allowedRoles) {
   return async (req, res, next) => {
-    const token = req.headers.authorization?.replace('Bearer ', '');
-    if (!token) return res.status(401).json({ error: 'Brak tokenu autoryzacji' });
+    const token = bearerToken(req);
+    if (!token) return res.status(401).json({ error: 'Brak tokenu autoryzacji', code: 'token_missing' });
 
-    const user = await getAuthUser(token);
-    if (!user?.id) return res.status(401).json({ error: 'Nieprawidłowy lub wygasły token' });
+    const { user, reason } = await verifyAuthToken(token);
+    if (!user?.id) {
+      // Odróżniamy odrzucony token (401 → klient odświeża sesję i ponawia) od błędu
+      // konfiguracji/sieci serwera (503) — to drugie NIE jest winą sesji użytkownika.
+      if (reason === 'invalid') {
+        return res.status(401).json({ error: 'Nieprawidłowy lub wygasły token', code: 'token_invalid' });
+      }
+      return res.status(503).json({
+        error: 'Serwer nie może zweryfikować sesji (sprawdź SUPABASE_URL i SUPABASE_ANON_KEY na serwerze).',
+        code:  'auth_unavailable',
+      });
+    }
 
     let rows;
     try {
@@ -75,6 +96,14 @@ function requireRole(allowedRoles) {
 }
 
 router.use(requireServiceKey);
+
+// Na Vercel (serverless) nie ma stałego procesu z setInterval — wygasłe kary czyścimy
+// „przy okazji" ruchu w panelu (maks. raz na minutę na instancję), zanim panel
+// odczyta statusy kont. Błąd sweepa nigdy nie blokuje żądania.
+router.use(async (_req, _res, next) => {
+  await maybeSweepSanctions();
+  next();
+});
 
 const requireModerator = requireRole(['moderator', 'admin']);
 const requireAdmin     = requireRole(['admin']);
@@ -205,10 +234,7 @@ router.patch('/users/:id/status', requireModerator, async (req, res) => {
     p_muted_until: until || null,
   });
 
-  if (!rpc.ok) {
-    return res.status(rpc.status === 403 ? 403 : 400)
-      .json({ error: rpc.body?.message || 'Nie udało się zmienić statusu konta' });
-  }
+  if (!rpc.ok) return sendRpcError(res, rpc, 'Nie udało się zmienić statusu konta');
 
   // Blokada logowania w warstwie auth – z czasem trwania (lub permanentnie / odblokowanie).
   try {
@@ -238,10 +264,7 @@ router.patch('/users/:id/role', requireAdmin, async (req, res) => {
     p_role:   role,
   });
 
-  if (!rpc.ok) {
-    return res.status(rpc.status === 403 ? 403 : 400)
-      .json({ error: rpc.body?.message || 'Nie udało się zmienić roli' });
-  }
+  if (!rpc.ok) return sendRpcError(res, rpc, 'Nie udało się zmienić roli');
   res.json({ ok: true, role });
 });
 

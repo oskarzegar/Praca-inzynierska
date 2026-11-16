@@ -1,8 +1,23 @@
 'use strict';
 
 import { Router } from 'express';
-import { sbFetch, sbFetchAsUser, getAuthUser } from '../lib/supabaseRest.js';
+import {
+  SB_URL, SB_ANON, SB_SERVICE, cleanEnv,
+  sbFetch, sbFetchAsUser, getAuthUser, bearerToken,
+  projectRefFromKey, projectRefFromUrl,
+} from '../lib/supabaseRest.js';
 import { tmdbFetch } from '../lib/tmdb.js';
+import { resolveSiteUrl } from '../lib/siteUrl.js';
+import { getAgeRatings, parseIds, MAX_IDS } from '../lib/ageRatingsService.js';
+import { createRateLimiter } from '../lib/rateLimit.js';
+
+// Każde ID w /movies/age-ratings to potencjalne zapytanie do TMDB — limit liczony w ID.
+// Strona główna to ~100 ID, więc 1500/min nie przeszkadza w normalnym przeglądaniu.
+const ageRatingsLimiter = createRateLimiter({
+  limit:   1500,
+  cost:    (req) => parseIds(req.query.ids).length,
+  message: 'Zbyt wiele zapytań o klasyfikacje wiekowe. Spróbuj za chwilę.',
+});
 
 const router = Router();
 
@@ -37,11 +52,62 @@ async function getMovieMeta(movieId) {
 }
 
 // ── 0. GET /api/config ───────────────────────────────────────────────────────
+// siteUrl: publiczny adres aplikacji dla linków w e-mailach auth (null → frontend
+// użyje window.location.origin). Wartości env są oczyszczone (spacje, cudzysłowy, „/").
 router.get('/config', (_req, res) => {
   res.json({
-    supabaseUrl:     process.env.SUPABASE_URL,
-    supabaseAnonKey: process.env.SUPABASE_ANON_KEY,
+    supabaseUrl:     SB_URL,
+    supabaseAnonKey: SB_ANON,
+    siteUrl:         resolveSiteUrl(),
   });
+});
+
+// ── 0b. GET /api/health ──────────────────────────────────────────────────────
+// Diagnostyka konfiguracji wdrożenia (np. Vercel) — WYŁĄCZNIE wartości logiczne,
+// żadnych sekretów. keysMatchProject=false oznacza klucze z innego projektu Supabase
+// niż SUPABASE_URL (typowa przyczyna „Nieprawidłowy lub wygasły token" na produkcji).
+router.get('/health', (_req, res) => {
+  const urlRef     = projectRefFromUrl(SB_URL);
+  const anonRef    = projectRefFromKey(SB_ANON);
+  const serviceRef = projectRefFromKey(SB_SERVICE);
+  const refs       = [anonRef, serviceRef].filter(Boolean);
+  res.set('Cache-Control', 'no-store').json({
+    ok: Boolean(SB_URL && SB_ANON && process.env.TMDB_API_KEY),
+    runtime:            process.env.VERCEL ? `vercel:${process.env.VERCEL_ENV || 'unknown'}` : 'node',
+    supabaseUrlSet:     Boolean(SB_URL),
+    supabaseUrlValid:   /^https:\/\/[^/\s]+$/.test(SB_URL || ''),
+    anonKeySet:         Boolean(SB_ANON),
+    serviceKeySet:      Boolean(SB_SERVICE),
+    keysMatchProject:   urlRef && refs.length ? refs.every((r) => r === urlRef) : null,
+    // true = surowa wartość w env miała spacje/nową linię/cudzysłowy/końcowy „/" (teraz
+    // normalizowane). Przed poprawką taki SUPABASE_URL dawał „Nieprawidłowy lub wygasły token".
+    envNeededCleanup: {
+      supabaseUrl: Boolean(process.env.SUPABASE_URL) && process.env.SUPABASE_URL !== SB_URL,
+      anonKey:     Boolean(process.env.SUPABASE_ANON_KEY) && process.env.SUPABASE_ANON_KEY !== SB_ANON,
+      serviceKey:  Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY) && process.env.SUPABASE_SERVICE_ROLE_KEY !== SB_SERVICE,
+    },
+    siteUrlConfigured:  Boolean(resolveSiteUrl()),
+    cronSecretSet:      Boolean(cleanEnv(process.env.CRON_SECRET)),
+    tmdbKeySet:         Boolean(process.env.TMDB_API_KEY),
+  });
+});
+
+// ── 0c. GET /api/movies/age-ratings?ids=1,2,3 ────────────────────────────────
+// Klasyfikacje wiekowe dla paczki filmów (filtr treści na kartach). Musi być
+// zarejestrowane PRZED /movies/:id, inaczej „age-ratings" zostałoby potraktowane jak ID.
+router.get('/movies/age-ratings', ageRatingsLimiter, async (req, res) => {
+  const ids = parseIds(req.query.ids);
+  if (!ids.length) return res.status(400).json({ error: `Parametr ids jest wymagany (maks. ${MAX_IDS} liczb oddzielonych przecinkami)` });
+  try {
+    const ratings = await getAgeRatings(ids);
+    const failed  = ids.filter((id) => ratings[id] === null).length;
+    if (failed === ids.length) return res.status(502).json({ error: 'TMDB nie odpowiada — nie udało się sprawdzić klasyfikacji' });
+    // Wynik częściowy (część ID z błędem) nie może trafić do cache przeglądarki/CDN
+    res.set('Cache-Control', failed ? 'no-store' : 'public, max-age=3600').json({ ratings });
+  } catch (err) {
+    console.error('Age ratings error:', err?.message || err);
+    res.status(502).json({ error: 'Błąd pobierania klasyfikacji wiekowych' });
+  }
 });
 
 // ── 1. GET /api/movies/popular ────────────────────────────────────────────────
@@ -161,7 +227,7 @@ router.get('/profiles/:id/watched', async (req, res) => {
 // Własne statystyki widzi właściciel (token); cudze tylko gdy watched_public=true.
 router.get('/profiles/:id/stats', async (req, res) => {
   const profileId = req.params.id;
-  const token     = req.headers.authorization?.replace('Bearer ', '');
+  const token     = bearerToken(req);
 
   try {
     const profiles = await sbFetch('profiles', { id: `eq.${profileId}`, select: 'watched_public' });
@@ -216,7 +282,7 @@ router.get('/profiles/:id/stats', async (req, res) => {
 // (na podstawie ocen i historii oglądania) oraz własnym rankingiem.
 // Tożsamość wynika z tokenu JWT, nie z parametru — bezpieczeństwo nie zależy od query.
 router.get('/recommendations', async (req, res) => {
-  const userToken = req.headers.authorization?.replace('Bearer ', '');
+  const userToken = bearerToken(req);
   if (!userToken) return res.status(401).json({ error: 'Brak tokenu autoryzacji' });
 
   const userId = await authUserId(userToken);

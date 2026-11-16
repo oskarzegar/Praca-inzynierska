@@ -39,19 +39,33 @@ export async function isAdmin() {
   return (await getCurrentRole()) === 'admin';
 }
 
-// Wywołanie chronionego endpointu panelu z dołączonym tokenem JWT.
-// Zwraca { ok, status, data } — wołający decyduje, jak obsłużyć błąd.
-export async function adminFetch(path, { method = 'GET', body } = {}) {
-  const { data: { session } } = await supabase.auth.getSession();
+async function callAdminApi(path, method, body, accessToken) {
   const res = await fetch(`/api/admin${path}`, {
     method,
     headers: {
       'Content-Type': 'application/json',
-      ...(session ? { Authorization: `Bearer ${session.access_token}` } : {}),
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
   });
   let data = null;
   try { data = await res.json(); } catch { /* puste body (np. 204) */ }
   return { ok: res.ok, status: res.status, data };
+}
+
+// Wywołanie chronionego endpointu panelu z dołączonym tokenem JWT.
+// Zwraca { ok, status, data } — wołający decyduje, jak obsłużyć błąd.
+// Gdy serwer odrzuci token (401 — np. karta była uśpiona i automatyczne odświeżanie
+// sesji nie zdążyło się wykonać), wymuszamy odświeżenie sesji i ponawiamy RAZ.
+export async function adminFetch(path, { method = 'GET', body } = {}) {
+  const { data: { session } } = await supabase.auth.getSession();
+  const first = await callAdminApi(path, method, body, session?.access_token);
+  if (first.status !== 401 || !session) return first;
+
+  const { data: refreshed, error } = await supabase.auth.refreshSession();
+  const token = refreshed?.session?.access_token;
+  if (error || !token) {
+    return { ...first, data: { ...(first.data || {}), error: 'Sesja wygasła — zaloguj się ponownie.' } };
+  }
+  return callAdminApi(path, method, body, token);
 }

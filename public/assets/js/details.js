@@ -8,6 +8,9 @@ import { initListButtons }       from "./lists.js";
 import { initReviews }           from "./reviews.js";
 import { initMovieRadar }        from "./movieRadar.js";
 import { loadMovieCommunityRating, buildCommunityBadgeLg } from "./communityRatings.js";
+import { pickCertification, minAgeFor, AGE_LEVELS } from "./ageRatings.js";
+import { getViewer, isAllowed, blockReason, onViewerChange } from "./ageGate.js";
+import { escapeHtml, escapeAttr } from "./utils.js";
 search();
 sidebar();
 // ID wybranego filmu odczytywane z URL: /film/tytul-rok-id → ostatni segment numeryczny
@@ -51,51 +54,46 @@ const addWatchProviders = function (movieDetail) {
     const providers = data.results && data.results.PL;
     if (!providers) return;
 
-    const hasAny = (providers.flatrate && providers.flatrate.length > 0) ||
-                   (providers.rent && providers.rent.length > 0) ||
-                   (providers.buy && providers.buy.length > 0);
-    if (!hasAny) return;
+    // Grupy z odpowiedzi TMDB/JustWatch. API NIE zwraca bezpośrednich linków do platform
+    // (deep links) — jedynie `link` do strony TMDB z pełną listą opcji dla tytułu.
+    const groups = [
+      ["flatrate", "Subskrypcja"],
+      ["free",     "Za darmo"],
+      ["ads",      "Z reklamami"],
+      ["rent",     "Wypożyczenie"],
+      ["buy",      "Zakup"],
+    ].filter(([key]) => Array.isArray(providers[key]) && providers[key].length > 0);
+    if (!groups.length) return;
 
     const streamingItem = document.createElement("div");
     streamingItem.classList.add("list-item", "streaming-section");
 
-    // Każde logo linkuje do strony JustWatch z pełną listą opcji dla tego tytułu
+    // Każde logo prowadzi do strony z opcjami dla tego tytułu (brak deep linków w API)
+    const link = typeof providers.link === "string" && /^https:\/\//.test(providers.link) ? providers.link : null;
     const buildProviderLogos = function (list) {
-      return list.map(p => `
-        <a href="${providers.link}" target="_blank" rel="noopener noreferrer" class="provider-logo" title="${p.provider_name}">
-          <img src="${imgBaseURL}w45${p.logo_path}" alt="${p.provider_name}" loading="lazy" />
-        </a>
-      `).join('');
+      return [...list]
+        .sort((a, b) => (a.display_priority ?? 99) - (b.display_priority ?? 99))
+        .map(p => {
+          const name = escapeAttr(p.provider_name);
+          const img  = `<img src="${imgBaseURL}w45${escapeAttr(p.logo_path)}" alt="${name}" loading="lazy" />`;
+          return link
+            ? `<a href="${escapeAttr(link)}" target="_blank" rel="noopener noreferrer" class="provider-logo" title="${name}">${img}</a>`
+            : `<span class="provider-logo" title="${name}">${img}</span>`;
+        }).join('');
     };
 
     let html = `<p class="list-name">Gdzie obejrzeć</p><div class="streaming-providers">`;
-
-    if (providers.flatrate && providers.flatrate.length > 0) {
+    for (const [key, label] of groups) {
       html += `<div class="provider-group">
-        <p class="provider-group-label">Subskrypcja</p>
-        <div class="providers-list">${buildProviderLogos(providers.flatrate)}</div>
+        <p class="provider-group-label">${label}</p>
+        <div class="providers-list">${buildProviderLogos(providers[key])}</div>
       </div>`;
     }
-
-    if (providers.rent && providers.rent.length > 0) {
-      html += `<div class="provider-group">
-        <p class="provider-group-label">Wypożyczenie</p>
-        <div class="providers-list">${buildProviderLogos(providers.rent)}</div>
-      </div>`;
-    }
-
-    if (providers.buy && providers.buy.length > 0) {
-      html += `<div class="provider-group">
-        <p class="provider-group-label">Zakup</p>
-        <div class="providers-list">${buildProviderLogos(providers.buy)}</div>
-      </div>`;
-    }
-
     html += `</div>`;
 
-    if (providers.link) {
-      html += `<a href="${providers.link}" target="_blank" rel="noopener noreferrer" class="justwatch-link">
-        Sprawdź wszystkie opcje na JustWatch →
+    if (link) {
+      html += `<a href="${escapeAttr(link)}" target="_blank" rel="noopener noreferrer" class="justwatch-link">
+        Sprawdź wszystkie opcje (TMDB / JustWatch) →
       </a>`;
     }
 
@@ -105,8 +103,8 @@ const addWatchProviders = function (movieDetail) {
   });
 };
 
-// append_to_response łączy 4 żądania w jedno — oszczędza 3 dodatkowe rundki sieciowe
-fetchData(`/api/tmdb/movie/${movieId}?language=pl&append_to_response=credits,videos,images,releases`, function (movie) {
+// append_to_response łączy 4 żądania w jedno (szczegóły, obsada, wideo, klasyfikacje wiekowe)
+fetchData(`/api/tmdb/movie/${movieId}?language=pl&append_to_response=credits,videos,release_dates`, async function (movie) {
   const {
     backdrop_path,
     poster_path,
@@ -118,8 +116,22 @@ fetchData(`/api/tmdb/movie/${movieId}?language=pl&append_to_response=credits,vid
     overview,
   } = movie;
 
-  // releases.countries[0].certification = klasyfikacja wiekowa (np. "PG-13"); może być pustym stringiem
-  const certification = movie.releases?.countries?.[0]?.certification || '';
+  // Klasyfikacja wiekowa wg priorytetu krajów (PL → US → GB → DE → FR), z opisem.
+  // Wcześniej brano releases.countries[0] — przypadkowy kraj, bez wyjaśnienia znaczenia.
+  const certInfo = pickCertification(movie.release_dates);
+  const minAge   = minAgeFor({ certification: certInfo, adult: movie.adult });
+
+  // Filtr treści: film powyżej wieku widza → zamiast szczegółów komunikat o blokadzie
+  const viewer = await getViewer();
+  if (!isAllowed(minAge, viewer.age)) {
+    renderAgeBlock(minAge, viewer);
+    return;
+  }
+
+  // Zmiana widza (np. wylogowanie dorosłego) może sprawić, że treść przestaje być dozwolona
+  onViewerChange((v) => { if (!isAllowed(minAge, v.age)) window.location.reload(); });
+
+  const certBadge = certInfo ? buildCertBadge(certInfo) : '';
   const cast          = movie.credits?.cast  || [];
   const crew          = movie.credits?.crew  || [];
   const videos        = movie.videos?.results || [];
@@ -138,13 +150,13 @@ fetchData(`/api/tmdb/movie/${movieId}?language=pl&append_to_response=credits,vid
             <div class="meta-list">
               <div class="meta-item">
                 <img src="./assets/imgs/star.svg" width="20" height="20" alt="rating" />
-                <span class="span">${vote_average.toFixed(1)}</span>
+                <span class="span">${Number(vote_average || 0).toFixed(1)}</span>
               </div>
               <div class="separator"></div>
               <div class="meta-item">${runtime}m</div>
               <div class="separator"></div>
               <div class="meta-item">${release_date ? release_date.split("-")[0] : ''}</div>
-              ${certification ? `<div class="meta-item card-badge">${certification}</div>` : ''}
+              ${certBadge}
             </div>
             <p class="genre">${getGenres(genres)}</p>
             <p class="overview">
@@ -198,6 +210,7 @@ fetchData(`/api/tmdb/movie/${movieId}?language=pl&append_to_response=credits,vid
     }
   });
 
+  initCertBadge(movieDetail);
   addWatchProviders(movieDetail);
   initListButtons(movieId, title, poster_path);
   fetchData(`/api/tmdb/movie/${movieId}/recommendations?page=1`, function (data) {
@@ -225,3 +238,70 @@ const addSuggestedMovies = function ({ results: movieList }) {
   }
   pageContent.appendChild(movieListElem);
 };
+
+// Plakietka klasyfikacji wiekowej z opisem (tooltip na hover/focus + tekst dla czytników ekranu)
+function buildCertBadge(info) {
+  const text = `${info.description} (klasyfikacja: ${info.countryName}).`;
+  return `
+    <button type="button" class="meta-item card-badge age-badge" aria-describedby="age-badge-tip">
+      ${escapeHtml(info.label)}
+      <span class="age-badge-tip" id="age-badge-tip" role="tooltip">${escapeHtml(text)}</span>
+    </button>`;
+}
+
+// Ekran blokady treści nieodpowiedniej dla wieku widza
+function renderAgeBlock(minAge, viewer) {
+  document.title = "Treść z ograniczeniem wiekowym - Filmy";
+  const legend = AGE_LEVELS.map(l => `<li><strong>${escapeHtml(l.label)}</strong> — ${escapeHtml(l.description)}</li>`).join("");
+  const unknownAge = viewer.age === null || viewer.age === undefined;
+  const action = !unknownAge ? "" : viewer.loggedIn
+    ? '<button type="button" class="btn auth-submit-btn age-block-action" data-age-action="settings">Ustaw datę urodzenia</button>'
+    : '<button type="button" class="btn auth-submit-btn age-block-action" data-age-action="login">Zaloguj się</button>';
+  pageContent.innerHTML = `
+    <section class="age-block" aria-labelledby="age-block-title">
+      <div class="age-block-badge" aria-hidden="true">${minAge}+</div>
+      <h1 class="heading age-block-title" id="age-block-title">Treść z ograniczeniem wiekowym</h1>
+      <p class="age-block-text">${escapeHtml(blockReason(minAge, viewer))}</p>
+      ${action}
+      <details class="age-block-legend">
+        <summary>Co oznaczają kategorie wiekowe?</summary>
+        <ul>${legend}</ul>
+      </details>
+      <a class="justwatch-link" href="/">← Wróć na stronę główną</a>
+    </section>`;
+  pageContent.querySelector("[data-age-action]")?.addEventListener("click", (e) => {
+    const goSettings = e.currentTarget.dataset.ageAction === "settings";
+    document.querySelector(".auth-btn")?.click();
+    if (goSettings) setTimeout(() => document.querySelector("#auth-edit-btn")?.click(), 0);
+  });
+  // Po zalogowaniu / zapisaniu daty urodzenia — przeładuj, gdy treść jest już dozwolona
+  // albo zmienił się stan logowania (inny komunikat i akcja na ekranie blokady)
+  onViewerChange((v) => {
+    if (isAllowed(minAge, v.age) || v.loggedIn !== viewer.loggedIn) window.location.reload();
+  });
+}
+
+// Tooltip klasyfikacji: hover/focus (desktop) + kliknięcie/dotknięcie (mobile — brak hovera).
+// Zamykany ponownym kliknięciem, kliknięciem poza plakietką lub klawiszem Escape.
+function initCertBadge(root) {
+  const badge = root.querySelector('.age-badge');
+  if (!badge) return;
+  badge.setAttribute('aria-expanded', 'false');
+  // --dismissed: tooltip zamknięty ręcznie (Escape / ponowne kliknięcie) pozostaje ukryty
+  // mimo hover/focus, dopóki kursor lub fokus nie opuści plakietki
+  const setOpen = (open) => {
+    const wasOpen = badge.classList.contains('age-badge--open');
+    badge.classList.toggle('age-badge--open', open);
+    badge.classList.toggle('age-badge--dismissed', !open && (wasOpen || badge.matches(':hover, :focus-visible')));
+    badge.setAttribute('aria-expanded', String(open));
+  };
+  const resetDismissed = () => badge.classList.remove('age-badge--dismissed');
+  badge.addEventListener('mouseleave', resetDismissed);
+  badge.addEventListener('blur', resetDismissed);
+  badge.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setOpen(!badge.classList.contains('age-badge--open'));
+  });
+  document.addEventListener('click', () => setOpen(false));
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setOpen(false); });
+}

@@ -106,8 +106,13 @@ TMDB_API_KEY=...
 SUPABASE_URL=https://<ref>.supabase.co
 SUPABASE_ANON_KEY=...
 SUPABASE_SERVICE_ROLE_KEY=...   # TYLKO serwer (panel admina, blokada logowania, czyszczenie kar)
+SITE_URL=https://twoja-app.vercel.app   # linki w e-mailach auth (opcjonalne; domyślnie bieżący adres)
+CRON_SECRET=...                 # Vercel Cron → /api/cron/sweep-sanctions
 PORT=3000
 ```
+
+Diagnostyka konfiguracji (bez sekretów): `GET /api/health` — m.in. czy `SUPABASE_URL` jest
+poprawny i czy klucze należą do tego samego projektu Supabase.
 
 **2. Baza danych** — w Supabase → SQL Editor uruchom **w kolejności**:
 
@@ -116,10 +121,19 @@ PORT=3000
 | 1 | [`db/supabase_setup.sql`](./db/supabase_setup.sql) | 6 tabel, RLS, trigger profilu, `delete_user`, bucket `avatars`, `movies_by_community_rating` |
 | 2–7 | [`db/10_rbac.sql`](./db/10_rbac.sql) → [`db/60_self_sanction_visibility.sql`](./db/60_self_sanction_visibility.sql) | role/RBAC, polityki moderacji, RPC ocen i rang, kary czasowe — szczegóły w [`db/README.md`](./db/README.md) |
 | 8 | [`db/70_security_fixes.sql`](./db/70_security_fixes.sql) | **KRYTYCZNE** — granty kolumnowe blokujące eskalację uprawnień, wyciek e-maili i nadpisywanie cudzych awatarów. Bez tego pliku RLS nie wystarcza (granty domyślne Supabase dają klientowi zapis/odczyt wszystkich kolumn). |
+| 9 | [`db/80_age_restrictions.sql`](./db/80_age_restrictions.sql) | prywatna data urodzenia (RPC tylko dla własnego konta) — filtr treści wg wieku |
+| 10 | [`db/90_sanction_sweep.sql`](./db/90_sanction_sweep.sql) | automatyczne zdejmowanie wygasłych kar (funkcja SQL + opcjonalnie pg_cron co minutę) |
 
 > ⚠️ **`db/70` jest obowiązkowy.** Samo RLS ogranicza tylko wiersze — bez grantów kolumnowych
 > dowolny zalogowany user jednym żądaniem ustawia sobie `role=admin`, zdejmuje własną karę i czyta
 > wszystkie e-maile. Weryfikacja po zastosowaniu: `npm run test:security`.
+
+**2b. Supabase → Authentication → URL Configuration** (wymagane, by linki z e-maili nie prowadziły na localhost):
+
+- **Site URL**: adres produkcyjny, np. `https://twoja-app.vercel.app`
+- **Redirect URLs**: `https://twoja-app.vercel.app/**`, `http://localhost:3000/**` (opcjonalnie deploymenty preview: `https://*-twoj-zespol.vercel.app/**`)
+
+Adres spoza tej listy Supabase zastępuje swoim Site URL. Szablony e-maili powinny używać `{{ .ConfirmationURL }}` (nie `{{ .SiteURL }}`).
 
 **3. Pierwszy administrator:**
 
@@ -299,6 +313,7 @@ utrwalane są referencje do TMDB (`movie_id`, `movie_title`, `poster_path`).
 ## Testy
 
 ```bash
+npm run lint        # kontrola składni wszystkich plików JS (node --check)
 npm test            # testy jednostkowe (offline, bez zależności)
 npm run test:security   # test napastniczy RLS/uprawnień (wymaga .env + sieci)
 ```

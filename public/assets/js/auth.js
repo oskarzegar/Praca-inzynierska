@@ -1,8 +1,26 @@
 'use strict';
 
-import { supabase } from './supabase.js';
+import { supabase, authRedirectBase } from './supabase.js';
 import { escapeAttr } from './utils.js';
 import { initSanctionNotice } from './sanctionNotice.js';
+import { initAgeGate, refreshViewer } from './ageGate.js';
+import { AGE_LEVELS, ageFromBirthDate } from './ageRatings.js';
+
+// Lokalna data „dzisiaj" w formacie YYYY-MM-DD (atrybut max pól daty urodzenia)
+function todayIso() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// Walidacja daty urodzenia (YYYY-MM-DD): komunikat błędu lub null, gdy poprawna
+function birthDateError(value) {
+  if (!value) return 'Podaj datę urodzenia.';
+  if (ageFromBirthDate(value) === null || value < '1900-01-01') return 'Podaj poprawną datę urodzenia.';
+  if (value > todayIso()) return 'Data urodzenia nie może być z przyszłości.';
+  return null;
+}
+
+const AGE_HELP = AGE_LEVELS.map((l) => `${l.label} — ${l.description}`).join(' ');
 
 // ─── HTML modalu ──────────────────────────────────────────────────────────────
 
@@ -63,6 +81,14 @@ const MODAL_HTML = `
                  placeholder="Powtórz hasło" required autocomplete="new-password" />
           <button type="button" class="auth-password-toggle" aria-label="Pokaż hasło"></button>
         </div>
+      </div>
+      <div class="auth-field">
+        <label class="auth-label" for="auth-reg-birth">Data urodzenia</label>
+        <input type="date" id="auth-reg-birth" class="auth-input" required
+               min="1900-01-01" autocomplete="bday" aria-describedby="auth-reg-birth-help" />
+        <p class="auth-help" id="auth-reg-birth-help">
+          Służy do ukrywania filmów nieodpowiednich dla Twojego wieku. Nie jest widoczna dla innych.
+        </p>
       </div>
       <p class="auth-message" id="auth-msg-register" aria-live="polite"></p>
       <button type="submit" class="btn auth-submit-btn" id="auth-btn-register">Zarejestruj się</button>
@@ -232,6 +258,18 @@ const MODAL_HTML = `
       <button type="submit" class="btn auth-submit-btn edit-save-btn" id="edit-btn-email">Zmień e-mail</button>
     </form>
 
+    <!-- Data urodzenia (filtr treści wg wieku) -->
+    <form class="edit-section" id="edit-form-birth" novalidate>
+      <p class="edit-section-label">Data urodzenia</p>
+      <div class="auth-field">
+        <input type="date" id="edit-birth-date" class="auth-input" min="1900-01-01"
+               autocomplete="bday" aria-describedby="edit-birth-help" />
+        <p class="auth-help" id="edit-birth-help"></p>
+      </div>
+      <p class="auth-message" id="auth-msg-birth" aria-live="polite"></p>
+      <button type="submit" class="btn auth-submit-btn edit-save-btn" id="edit-btn-birth">Zapisz datę</button>
+    </form>
+
     <!-- Hasło -->
     <form class="edit-section" id="edit-form-password" novalidate>
       <p class="edit-section-label">Hasło</p>
@@ -394,6 +432,12 @@ async function initAuth() {
   const formEditName     = modal.querySelector('#edit-form-name');
   const formEditEmail    = modal.querySelector('#edit-form-email');
   const formEditPassword = modal.querySelector('#edit-form-password');
+  const formEditBirth    = modal.querySelector('#edit-form-birth');
+  const editBirthInput   = modal.querySelector('#edit-birth-date');
+  const editBirthHelp    = modal.querySelector('#edit-birth-help');
+  const msgBirth         = modal.querySelector('#auth-msg-birth');
+  const btnEditBirth     = modal.querySelector('#edit-btn-birth');
+  const regBirthInput    = modal.querySelector('#auth-reg-birth');
 
   const msgLogin        = modal.querySelector('#auth-msg-login');
   const msgRegister     = modal.querySelector('#auth-msg-register');
@@ -434,6 +478,15 @@ async function initAuth() {
   btnEditName.dataset.label      = btnEditName.textContent;
   btnEditEmail.dataset.label     = btnEditEmail.textContent;
   btnEditPassword.dataset.label  = btnEditPassword.textContent;
+  btnEditBirth.dataset.label     = btnEditBirth.textContent;
+
+  // Data urodzenia nie może być z przyszłości (max ustawiany dynamicznie)
+  regBirthInput.max  = todayIso();
+  editBirthInput.max = todayIso();
+  editBirthInput.title = AGE_HELP;
+
+  // Filtr treści wg wieku — obserwuje karty filmów na każdej stronie z nagłówkiem
+  initAgeGate();
 
   // ── Przełączniki widoczności hasła ───────────────────────────────────────────
 
@@ -557,6 +610,24 @@ async function initAuth() {
     userNameEl.textContent  = displayName || email.split('@')[0];
     userEmailEl.textContent = email;
 
+    syncBirthDateFromSignup(session);
+
+  }
+
+  // Data urodzenia podana przy rejestracji trafia do user_metadata. Jeśli trigger bazy
+  // jej nie przepisał (np. konto założone przed migracją 80), uzupełniamy profil raz.
+  // Odroczone setTimeout — updateUI bywa wołane z callbacku onAuthStateChange.
+  let birthSynced = null;
+  function syncBirthDateFromSignup(session) {
+    const metaBirth = session?.user?.user_metadata?.birth_date;
+    if (!metaBirth || birthSynced === session.user.id || birthDateError(metaBirth)) return;
+    birthSynced = session.user.id;
+    setTimeout(async () => {
+      const { data: current, error } = await supabase.rpc('get_my_birth_date');
+      if (error || current) return;
+      const { error: setError } = await supabase.rpc('set_my_birth_date', { p_birth_date: metaBirth });
+      if (!setError) refreshViewer();
+    }, 0);
   }
 
   // ── Inicjalna sesja ───────────────────────────────────────────────────────────
@@ -591,11 +662,20 @@ async function initAuth() {
     const email    = modal.querySelector('#auth-reg-email').value.trim();
     const password = modal.querySelector('#auth-reg-password').value;
     const confirm  = modal.querySelector('#auth-reg-confirm').value;
+    const birth    = regBirthInput.value;
     if (password !== confirm) { setMsg(msgRegister, 'Hasła nie są identyczne.'); return; }
+    const birthErr = birthDateError(birth);
+    if (birthErr) { setMsg(msgRegister, birthErr); return; }
     setLoading(btnRegister, 'Rejestracja…', true);
+    // emailRedirectTo: stały adres produkcyjny (SITE_URL) lub bieżący origin — bez
+    // ścieżki/parametrów bieżącej strony, by pasował do listy Redirect URLs w Supabase.
+    // birth_date trafia do raw_user_meta_data → trigger handle_new_user zapisuje ją w profilu.
     const { error } = await supabase.auth.signUp({
       email, password,
-      options: { emailRedirectTo: window.location.href },
+      options: {
+        emailRedirectTo: `${authRedirectBase}/`,
+        data: { birth_date: birth },
+      },
     });
     setLoading(btnRegister, '', false);
     if (error) {
@@ -638,7 +718,7 @@ async function initAuth() {
     setLoading(btnReset, 'Wysyłanie…', true);
     // redirectTo prowadzi do dedykowanej strony, która wykryje sesję odzyskiwania i pozwoli ustawić nowe hasło
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${window.location.origin}/reset-password.html`,
+      redirectTo: `${authRedirectBase}/reset-password.html`,
     });
     setLoading(btnReset, '', false);
 
@@ -738,6 +818,12 @@ async function initAuth() {
     toggleWatchlist.checked = profile?.watchlist_public ?? false;
     toggleWatched.checked   = profile?.watched_public   ?? false;
 
+    // Data urodzenia — prywatna kolumna, odczyt przez RPC (tylko własny profil)
+    clearMsg(msgBirth);
+    const { data: birth, error: birthError } = await supabase.rpc('get_my_birth_date');
+    editBirthInput.value = !birthError && typeof birth === 'string' ? birth : '';
+    renderBirthHelp(editBirthInput.value, Boolean(birthError));
+
     // Podgląd awatara w widoku edycji
     const avatarUrl = profile?.avatar_url;
     const initial   = ((profile?.display_name || user.email)[0]).toUpperCase();
@@ -773,6 +859,10 @@ async function initAuth() {
       btn.classList.toggle('theme-btn--active', btn.dataset.themeVal === stored);
     }
   }
+
+  window.matchMedia('(prefers-color-scheme: light)').addEventListener?.('change', (e) => {
+    if ((localStorage.getItem('theme') || 'system') === 'system') applyTheme(e.matches ? 'light' : 'dark');
+  });
 
   for (const btn of modal.querySelectorAll('.theme-btn')) {
     btn.addEventListener('click', () => {
@@ -921,7 +1011,10 @@ async function initAuth() {
     if (!email) { setMsg(msgEmailEdit, 'Podaj adres e-mail.'); return; }
 
     setLoading(btnEditEmail, 'Wysyłanie…', true);
-    const { error } = await supabase.auth.updateUser({ email });
+    const { error } = await supabase.auth.updateUser(
+      { email },
+      { emailRedirectTo: `${authRedirectBase}/` },
+    );
     setLoading(btnEditEmail, '', false);
 
     if (error) {
@@ -931,6 +1024,40 @@ async function initAuth() {
       // Zmiana e-maila wymaga kliknięcia linku potwierdzającego wysłanego na nowy adres
       setMsg(msgEmailEdit, 'Link potwierdzający wysłany na nowy adres e-mail.', false);
     }
+  });
+
+  // ── Edycja profilu — data urodzenia (filtr treści wg wieku) ──────────────────
+  function renderBirthHelp(value, unavailable = false) {
+    if (unavailable) {
+      editBirthHelp.textContent = 'Zapis daty urodzenia jest chwilowo niedostępny (brak migracji bazy 80_age_restrictions.sql).';
+      return;
+    }
+    const age = ageFromBirthDate(value);
+    editBirthHelp.textContent = age === null
+      ? 'Nie podano daty — do czasu jej uzupełnienia ukrywamy filmy z kategorią 18+. Data nie jest widoczna dla innych.'
+      : `Wiek: ${age} lat. Filmy z wyższą kategorią wiekową będą zablokowane. Data nie jest widoczna dla innych.`;
+  }
+
+  formEditBirth.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    clearMsg(msgBirth);
+    const value = editBirthInput.value;
+    const err = birthDateError(value);
+    if (err) { setMsg(msgBirth, err); return; }
+
+    setLoading(btnEditBirth, 'Zapisywanie…', true);
+    const { error } = await supabase.rpc('set_my_birth_date', { p_birth_date: value });
+    setLoading(btnEditBirth, '', false);
+
+    if (error) {
+      setMsg(msgBirth, error.code === 'PGRST202'
+        ? 'Funkcja zapisu nie istnieje w bazie — uruchom migrację db/80_age_restrictions.sql.'
+        : 'Błąd zapisu daty urodzenia. Spróbuj ponownie.');
+      return;
+    }
+    renderBirthHelp(value);
+    setMsg(msgBirth, 'Data urodzenia zapisana. Filtr treści został zaktualizowany.', false);
+    refreshViewer();
   });
 
   // ── Edycja profilu — hasło ────────────────────────────────────────────────────

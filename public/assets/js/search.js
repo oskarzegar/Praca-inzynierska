@@ -4,6 +4,17 @@ import { fetchData } from "./api.js";
 import { createMovieCard } from "./movie-card.js";
 import { supabase } from "./supabase.js";
 import { loadCommunityRatings, updateCardsInDOM } from "./communityRatings.js";
+import { validateYearRange, MIN_YEAR, maxYear } from "./yearRange.js";
+
+// TMDB zwraca maksymalnie 500 stron wyników — żądanie strony 501+ kończy się HTTP 400
+const TMDB_MAX_PAGES = 500;
+
+// fetch → JSON z kontrolą statusu (błąd zamiast cichego zawieszenia na „Ładowanie...")
+async function fetchJson(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
 
 export function search() {
   loadCommunityRatings();
@@ -70,9 +81,9 @@ export function search() {
         <div class="filter-field">
           <label class="filter-label">Rok (od – do)</label>
           <div class="filter-range">
-            <input type="number" id="adv-year-from" class="filter-input filter-input-sm" placeholder="np. 2000" min="1888" max="2026" />
+            <input type="number" id="adv-year-from" class="filter-input filter-input-sm" placeholder="np. 2000" min="${MIN_YEAR}" max="${maxYear()}" step="1" />
             <span class="filter-sep">–</span>
-            <input type="number" id="adv-year-to" class="filter-input filter-input-sm" placeholder="2026" min="1888" max="2026" />
+            <input type="number" id="adv-year-to" class="filter-input filter-input-sm" placeholder="${new Date().getFullYear()}" min="${MIN_YEAR}" max="${maxYear()}" step="1" />
           </div>
         </div>
 
@@ -181,6 +192,10 @@ export function search() {
   const filtersToggleBtn = searchModal.querySelector("#adv-filters-toggle");
 
   const getVal            = (id) => searchModal.querySelector(`#${id}`).value.trim();
+  const isBadInput        = (id) => Boolean(searchModal.querySelector(`#${id}`).validity?.badInput);
+  const getYearRange      = () => (isBadInput("adv-year-from") || isBadInput("adv-year-to"))
+    ? { ok: false, reason: "invalid", message: "Rok musi być liczbą całkowitą (np. 1999)." }
+    : validateYearRange(getVal("adv-year-from"), getVal("adv-year-to"));
   const hasNumericFilters = () =>
     getVal("adv-year-from") || getVal("adv-year-to") ||
     getVal("adv-rating-from") || getVal("adv-rating-to") ||
@@ -249,7 +264,14 @@ export function search() {
 
   // ── Otwieranie / zamykanie modalu ───────────────────────────────────────────
 
+  const setLupaExpanded = (expanded) => {
+    for (const lupa of document.querySelectorAll(".header .search-btn[menu-close]")) {
+      lupa.setAttribute("aria-expanded", String(expanded));
+    }
+  };
+
   const openModal = (withFilters = false) => {
+    setLupaExpanded(true);
     searchModal.classList.add("active");
     searchModal.style.visibility = "visible";
     if (withFilters) showFilters();
@@ -259,6 +281,7 @@ export function search() {
   };
 
   const closeModal = () => {
+    setLupaExpanded(false);
     searchModal.classList.remove("active");
     searchModal.style.visibility = "";
     searchBox.classList.remove("active");
@@ -278,9 +301,16 @@ export function search() {
   // Przycisk filtrów w nagłówku otwiera modal z rozwiniętym panelem filtrów
   filterBtn.addEventListener("click", () => openModal(true));
 
-  // Lupa w nagłówku otwiera JEDEN zaawansowany system wyszukiwania z wszystkimi filtrami
+  // Lupa w nagłówku PRZEŁĄCZA zaawansowane wyszukiwanie: pierwsze kliknięcie otwiera,
+  // kolejne zamyka. Wcześniej zawsze wołała openModal, więc ponowne kliknięcie nie
+  // zamykało okna (a global.js przełączał w tle ukryty search-box).
   for (const lupa of document.querySelectorAll(".header .search-btn[menu-close]")) {
-    lupa.addEventListener("click", () => openModal(true));
+    lupa.setAttribute("aria-expanded", "false");
+    lupa.setAttribute("aria-label", "Wyszukiwanie");
+    lupa.addEventListener("click", () => {
+      if (searchModal.classList.contains("active")) closeModal();
+      else openModal(true);
+    });
   }
 
   searchModal.querySelector("#adv-close-btn").addEventListener("click", closeModal);
@@ -309,19 +339,36 @@ export function search() {
   let currentPage = 1;
   let totalPages  = 0;
   let currentMode = null;
+  let searchSeq   = 0;   // numer bieżącego wyszukiwania — starsze odpowiedzi są ignorowane
+
+  const capPages = (n) => Math.min(Math.max(Number(n) || 1, 1), TMDB_MAX_PAGES);
+
+  function showMessage(text, cls = "no-results") {
+    resultsGrid.innerHTML = "";
+    const p = document.createElement("p");
+    p.className = cls;
+    p.textContent = text;
+    resultsGrid.appendChild(p);
+    loadMoreBtn.style.display = "none";
+  }
+
+  function showFetchError(err) {
+    console.error("search:", err?.message || err);
+    showMessage("Nie udało się pobrać wyników. Sprawdź połączenie i spróbuj ponownie.");
+  }
 
   function buildDiscoverUrl(page = 1) {
     const sortBy = getVal("adv-sort-by") || "popularity.desc";
-    let url = `/api/tmdb/discover/movie?language=pl&page=${page}&sort_by=${sortBy}&vote_count.gte=10`;
-    const yf = getVal("adv-year-from"), yt = getVal("adv-year-to");
+    let url = `/api/tmdb/discover/movie?language=pl&page=${page}&sort_by=${encodeURIComponent(sortBy)}&vote_count.gte=10`;
+    const { from: yf, to: yt } = getYearRange();   // wołane tylko gdy zakres jest poprawny
     const rf = getVal("adv-rating-from"), rt = getVal("adv-rating-to");
     const nf = getVal("adv-runtime-from"), nt = getVal("adv-runtime-to");
     if (yf) url += `&primary_release_date.gte=${yf}-01-01`;
     if (yt) url += `&primary_release_date.lte=${yt}-12-31`;
-    if (rf) url += `&vote_average.gte=${rf}`;
-    if (rt) url += `&vote_average.lte=${rt}`;
-    if (nf) url += `&with_runtime.gte=${nf}`;
-    if (nt) url += `&with_runtime.lte=${nt}`;
+    if (rf) url += `&vote_average.gte=${encodeURIComponent(rf)}`;
+    if (rt) url += `&vote_average.lte=${encodeURIComponent(rt)}`;
+    if (nf) url += `&with_runtime.gte=${encodeURIComponent(nf)}`;
+    if (nt) url += `&with_runtime.lte=${encodeURIComponent(nt)}`;
     return url;
   }
 
@@ -334,7 +381,7 @@ export function search() {
   }
 
   function applyClientFilters(list) {
-    const yf = getVal("adv-year-from"),   yt = getVal("adv-year-to");
+    const { from: yf, to: yt } = getYearRange();
     const rf = getVal("adv-rating-from"), rt = getVal("adv-rating-to");
     return list.filter(m => {
       const year   = m.release_date ? +m.release_date.slice(0, 4) : null;
@@ -396,7 +443,7 @@ export function search() {
   }
 
   // Wielokryterialny filtr ocen społeczności (WF-09) — RPC movies_by_community_rating_multi
-  async function doCommunitySearch(page = 1, append = false) {
+  async function doCommunitySearch(page = 1, append = false, seq = searchSeq) {
     if (!append || communityCache.length === 0) {
       const { data, error } = await supabase.rpc("movies_by_community_rating_multi", {
         min_overall: num(getVal("adv-community-rating-min")),
@@ -406,6 +453,7 @@ export function search() {
         min_effects: num(getVal("adv-community-effects-min")),
         sort_by:     getVal("adv-community-sort") || "overall",
       });
+      if (seq !== searchSeq) return;   // w międzyczasie uruchomiono nowe wyszukiwanie
       if (error || !data || data.length === 0) {
         resultsGrid.innerHTML = '<p class="no-results">Brak filmów spełniających kryteria ocen społeczności.</p>';
         loadMoreBtn.style.display = "none";
@@ -430,6 +478,7 @@ export function search() {
         } catch { return null; }
       })
     );
+    if (seq !== searchSeq) return;
     for (const movie of results.filter(Boolean)) {
       if (!movie.release_date) continue;
       resultsGrid.appendChild(createMovieCard(movie));
@@ -438,42 +487,68 @@ export function search() {
     loadMoreBtn.style.display = page < totalPages ? "block" : "none";
   }
 
+  // Wspólne przetwarzanie strony wyników trybu „search" (tekst + filtry po stronie klienta)
+  async function processSearchResults(results) {
+    let movies = safeMovies(results || []);
+    if (getVal("adv-runtime-from") || getVal("adv-runtime-to")) movies = await applyRuntimeFilter(movies);
+    if (getVal("adv-year-from") || getVal("adv-year-to") || getVal("adv-rating-from") || getVal("adv-rating-to")) movies = applyClientFilters(movies);
+    return sortClientSide(movies);
+  }
+
   function doSearch(page = 1, append = false) {
     const query          = advQueryField.value.trim();
     const numericFilters = hasNumericFilters();
+    const seq            = ++searchSeq;
     showExpanded();
     if (!append) {
       currentPage = 1;
       resultsGrid.innerHTML = '<p class="results-loading">Ładowanie...</p>';
       loadMoreBtn.style.display = "none";
+      loadMoreBtn.classList.remove("loading");
       resultsInfo.textContent = "";
       advQueryField.focus();
     }
     if (hasCommunityFilters()) {
       currentMode = "community";
       if (!append) communityCache = [];
-      doCommunitySearch(page, append);
+      doCommunitySearch(page, append, seq).catch((err) => { if (seq === searchSeq) showFetchError(err); });
       return;
     }
+
+    // Zakres lat: nieprawidłowy lub spoza bazy → pusty stan bez zapytania do API
+    // (TMDB zignorowałby taki filtr i zwrócił wszystkie filmy).
+    const years = getYearRange();
+    if (!years.ok) {
+      currentMode = null;
+      totalPages = 0;
+      resultsInfo.textContent = years.message;
+      showMessage("Brak wyników dla podanego zakresu lat.");
+      return;
+    }
+
     if (numericFilters && !query) {
       currentMode = "discover";
-      fetchData(buildDiscoverUrl(page), ({ results, total_pages }) => {
-        totalPages = total_pages || 1;
-        renderMovies(results, append);
-        loadMoreBtn.style.display = currentPage < totalPages ? "block" : "none";
-      });
+      fetchJson(buildDiscoverUrl(page))
+        .then(({ results, total_pages }) => {
+          if (seq !== searchSeq) return;
+          totalPages = capPages(total_pages);
+          renderMovies(results || [], append);
+          loadMoreBtn.style.display = currentPage < totalPages ? "block" : "none";
+        })
+        .catch((err) => { if (seq === searchSeq) showFetchError(err); });
     } else if (query) {
       currentMode = "search";
-      fetch(buildSearchUrl(query, page))
-        .then(r => r.json())
+      fetchJson(buildSearchUrl(query, page))
         .then(async ({ results, total_pages }) => {
-          totalPages = total_pages || 1;
-          let movies = safeMovies(results);
-          if (getVal("adv-runtime-from") || getVal("adv-runtime-to")) movies = await applyRuntimeFilter(movies);
-          if (getVal("adv-year-from") || getVal("adv-year-to") || getVal("adv-rating-from") || getVal("adv-rating-to")) movies = applyClientFilters(movies);
-          renderMovies(sortClientSide(movies), append);
+          const movies = await processSearchResults(results);
+          if (seq !== searchSeq) return;
+          totalPages = capPages(total_pages);
+          renderMovies(movies, append);
           loadMoreBtn.style.display = currentPage < totalPages ? "block" : "none";
-        });
+        })
+        .catch((err) => { if (seq === searchSeq) showFetchError(err); });
+    } else {
+      showCompact();
     }
   }
 
@@ -515,32 +590,50 @@ export function search() {
 
   loadMoreBtn.addEventListener("click", function () {
     if (currentPage >= totalPages) { this.style.display = "none"; return; }
+    // Filtry lat mogły zostać zmienione po wyszukiwaniu na nieprawidłowe — nie doładowuj
+    // kolejnej strony z pominiętym filtrem (TMDB zwróciłby wszystkie filmy)
+    if (currentMode !== "community") {
+      const years = getYearRange();
+      if (!years.ok) { resultsInfo.textContent = years.message; return; }
+    }
     currentPage++;
     this.classList.add("loading");
+    const seq   = searchSeq;
     const query = advQueryField.value.trim();
+    const done  = () => this.classList.remove("loading");
+    const fail  = (err) => {
+      done();
+      if (seq !== searchSeq) return;   // błąd porzuconego żądania — nie ruszaj nowego stanu
+      currentPage--;
+      console.error("search (więcej):", err?.message || err);
+      resultsInfo.textContent = "Nie udało się wczytać kolejnych wyników. Spróbuj ponownie.";
+    };
+
     if (currentMode === "community") {
-      doCommunitySearch(currentPage, true).then(() => this.classList.remove("loading"));
+      doCommunitySearch(currentPage, true, seq).then(done, fail);
       return;
     }
     if (currentMode === "search") {
-      fetch(buildSearchUrl(query, currentPage))
-        .then(r => r.json())
+      fetchJson(buildSearchUrl(query, currentPage))
         .then(async ({ results, total_pages }) => {
-          this.classList.remove("loading");
-          totalPages = total_pages || totalPages;
-          let movies = safeMovies(results);
-          if (getVal("adv-runtime-from") || getVal("adv-runtime-to")) movies = await applyRuntimeFilter(movies);
-          if (getVal("adv-year-from") || getVal("adv-year-to") || getVal("adv-rating-from") || getVal("adv-rating-to")) movies = applyClientFilters(movies);
-          renderMovies(sortClientSide(movies), true);
+          const movies = await processSearchResults(results);
+          done();
+          if (seq !== searchSeq) return;
+          totalPages = capPages(total_pages ?? totalPages);
+          renderMovies(movies, true);
           this.style.display = currentPage < totalPages ? "block" : "none";
-        });
+        })
+        .catch(fail);
     } else {
-      fetchData(buildDiscoverUrl(currentPage), ({ results, total_pages }) => {
-        this.classList.remove("loading");
-        totalPages = total_pages || totalPages;
-        renderMovies(results, true);
-        this.style.display = currentPage < totalPages ? "block" : "none";
-      });
+      fetchJson(buildDiscoverUrl(currentPage))
+        .then(({ results, total_pages }) => {
+          done();
+          if (seq !== searchSeq) return;
+          totalPages = capPages(total_pages ?? totalPages);
+          renderMovies(results || [], true);
+          this.style.display = currentPage < totalPages ? "block" : "none";
+        })
+        .catch(fail);
     }
   });
 }

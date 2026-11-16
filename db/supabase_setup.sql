@@ -104,9 +104,13 @@ $$;
 --      • "Secure email change" — opcjonalnie włącz dla bezpieczeństwa
 --
 --    Supabase → Authentication → URL Configuration
---      • Site URL — ustaw na adres swojej aplikacji (np. http://localhost:5500)
---      • Redirect URLs — dodaj adresy, na które Supabase może przekierowywać
---        po potwierdzeniu e-mail (np. http://localhost:5500/index.html)
+--      • Site URL — adres PRODUKCYJNY aplikacji (np. https://twoja-app.vercel.app).
+--        Supabase używa go zawsze, gdy adres przekierowania nie jest na liście poniżej
+--        (stąd brały się linki do localhost w mailach).
+--      • Redirect URLs — dozwolone adresy przekierowań, np.:
+--          https://twoja-app.vercel.app/**
+--          https://*-twoj-zespol.vercel.app/**   (deploymenty preview, opcjonalnie)
+--          http://localhost:3000/**              (lokalny rozwój)
 
 
 -- ─── 7. Kolumna awatara w profilu ───────────────────────────────────────────
