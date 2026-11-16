@@ -61,6 +61,7 @@ Główni interesariusze systemu: **widz okazjonalny** (chce prostego dziennika i
 | WF-06 | System umożliwia **ukrywanie filmów już obejrzanych** w wynikach przeglądania. | Średni |
 | WF-07 | Karta filmu prezentuje **średnie oceny serwisu na wykresie radarowym** (podział na podkategorie). | Wysoki |
 | WF-21 | **Wyszukiwanie zaawansowane** umożliwia filtrowanie po: roku produkcji, ocenie TMDB, długości filmu oraz ocenie serwisu (minimum), z wyborem sposobu sortowania wyników. | Średni |
+| WF-25 | System **ogranicza widoczność filmów według wieku** zalogowanego użytkownika (data urodzenia podawana przy rejestracji, widoczna tylko dla właściciela konta): filmy z klasyfikacją wiekową (PL, a przy jej braku US/GB/DE/FR) powyżej wieku użytkownika są blokowane; przy nieznanym wieku blokowane są tylko treści 18+. | Średni |
 
 #### C. Oceny i recenzje
 | ID | Wymaganie | Priorytet |
@@ -92,6 +93,7 @@ Główni interesariusze systemu: **widz okazjonalny** (chce prostego dziennika i
 
 - **Wydajność:** wyniki wyszukiwania/filtrowania powinny być prezentowane w czasie nieprzekraczającym ok. 3 s; dane z TMDB powinny być buforowane (cache) w celu ograniczenia liczby zapytań i opóźnień.
 - **Bezpieczeństwo:** hasła przechowywane wyłącznie w postaci skrótów (hashowanie); komunikacja po HTTPS/TLS; **sanityzacja i escaping treści recenzji** w celu ochrony przed atakami XSS; **ograniczanie liczby zapytań (rate limiting)** do warstwy proxy TMDB; kontrola dostępu egzekwowana po stronie serwera (RBAC), a nie wyłącznie w interfejsie.
+- **Niezawodność:** awaria lub spowolnienie usług zewnętrznych (TMDB, Supabase) ani nieprawidłowe dane wejściowe nie mogą przerwać pracy serwera — zapytania do TMDB mają limit czasu (8 s), a błędy są zwracane jako czytelne komunikaty (JSON, bez szczegółów technicznych); wygasłe kary czasowe są zdejmowane automatycznie.
 - **Użyteczność:** interfejs responsywny i intuicyjny; czytelne wizualizacje (wykresy radarowe, rozkład dekad); spójne, jednoznaczne oznaczanie spoilerów.
 - **Kompatybilność:** poprawne działanie w aktualnych wersjach popularnych przeglądarek (Chrome, Firefox, Edge, Safari) oraz na urządzeniach mobilnych (projekt responsywny).
 
@@ -227,7 +229,7 @@ Relacje warte uzasadnienia na obronie:
 | **Cel** | Ograniczenie aktywności użytkownika naruszającego zasady poprzez wyciszenie lub zablokowanie jego konta. |
 | **Warunki początkowe** | Moderator jest zalogowany i posiada rolę Moderator lub Admin; konto docelowego użytkownika istnieje. |
 | **Przebieg główny** | 1. Moderator otwiera profil lub recenzję problematycznego użytkownika. 2. Wybiera akcję „Wycisz/Zablokuj konto". 3. System prezentuje opcje (wyciszenie czasowe / blokada) i pole na powód. 4. Moderator wybiera typ sankcji i zatwierdza. 5. System weryfikuje uprawnienia Moderatora. 6. System zmienia status konta na „Wyciszone" lub „Zablokowane". 7. System odbiera użytkownikowi możliwość dodawania treści. 8. System wyświetla potwierdzenie. |
-| **Scenariusz alternatywny** | **Krok 5 – brak uprawnień** (np. próba sankcji wobec Admina lub konta o równej/wyższej roli): system odrzuca akcję i wyświetla komunikat o braku uprawnień. **Krok 4 – anulowanie:** Moderator przerywa operację; status konta pozostaje bez zmian. |
+| **Scenariusz alternatywny** | **Krok 5 – brak uprawnień** (np. próba sankcji wobec Admina lub konta o równej/wyższej roli): system odrzuca akcję i wyświetla komunikat o braku uprawnień. **Krok 4 – anulowanie:** Moderator przerywa operację; status konta pozostaje bez zmian. **Krok 4 – nieprawidłowy termin kary:** system odrzuca żądanie z komunikatem o nieprawidłowej dacie; status konta pozostaje bez zmian. **Krok 6 – awaria bazy danych lub połączenia:** system wyświetla komunikat o niepowodzeniu; status konta pozostaje bez zmian. **Krok 6 – blokada logowania nie powiodła się** (status zapisany, ale usługa uwierzytelniania odrzuciła blokadę): system informuje o częściowym powodzeniu, aby Moderator mógł ponowić operację. |
 | **Warunki końcowe** | Konto docelowe ma status „Wyciszone" lub „Zablokowane", a jego możliwość publikowania treści jest ograniczona zgodnie z sankcją – albo operacja została odrzucona/anulowana i status pozostał bez zmian. |
 
 ---
@@ -436,12 +438,13 @@ System został zbudowany w architekturze klient–serwer z chmurowym zapleczem d
 
 | Warstwa | Technologia | Rola |
 |---|---|---|
-| Serwer aplikacji | Node.js 22, Express 4.19 (ES Modules) | Serwowanie frontendu, proxy do TMDB, endpoint konfiguracyjny `/api/config` |
+| Serwer aplikacji | Node.js 22, Express 4 (ES Modules) | Serwowanie frontendu, proxy do TMDB, REST API (`/api`: filmy, profile, statystyki, rekomendacje, klasyfikacje wiekowe, konfiguracja klienta), panel moderacji z RBAC (`/api/admin`), zadanie cykliczne zdejmowania wygasłych kar (`/api/cron`) |
+| Warstwa serwera | `routes/` (routing HTTP) + `lib/` (logika biznesowa i dostęp do danych) | Trasy obsługują tylko przepływ HTTP; statystyki, rekomendacje, klasyfikacje wiekowe i czyszczenie kar są w modułach `lib/`, a jedynymi modułami wysyłającymi zapytania do Supabase i TMDB są `lib/supabaseRest.js` i `lib/tmdb.js` |
 | Konfiguracja / dokumentacja API | `dotenv`, `swagger-ui-express` | Zmienne środowiskowe (`.env`); dokumentacja API pod `/api/docs` |
-| Proxy danych filmowych | `routes/tmdb.js` | Pośredniczenie w zapytaniach do `api.themoviedb.org/3`; klucz `TMDB_API_KEY` doklejany po stronie serwera (nie trafia do przeglądarki); język `pl` |
+| Proxy danych filmowych | `routes/tmdb.js` + `lib/tmdb.js` | Pośredniczenie w zapytaniach do `api.themoviedb.org/3`; klucz `TMDB_API_KEY` doklejany po stronie serwera (nie trafia do przeglądarki); język `pl`; whitelist ścieżek, cache 10 min, limit czasu 8 s, limit 600 zapytań/min na adres IP |
 | Frontend | Statyczny HTML (katalog `public/`) + czysty JavaScript (moduły ES, bez frameworka) | Interfejs użytkownika; preferencja motywu jasny/ciemny w `localStorage` |
 | Uwierzytelnianie | Supabase Auth | Rejestracja i logowanie (e-mail + hasło), weryfikacja e-mail, reset hasła |
-| Baza danych | Supabase PostgreSQL | 6 tabel + funkcje RPC + Row Level Security (RLS) |
+| Baza danych | Supabase PostgreSQL | 7 tabel + funkcje RPC + Row Level Security (RLS) + granty kolumnowe |
 | Magazyn plików | Supabase Storage (bucket `avatars`) | Zdjęcia profilowe – publiczny bucket, limit 2 MB, formaty JPG/PNG/WebP |
 | Klient bazy | `@supabase/supabase-js` v2 (ładowany przez ESM) | Komunikacja frontendu z Supabase; klucze (URL + anon key) pobierane z `/api/config` |
 | Źródło danych o filmach | TMDB API (The Movie Database) | Katalog filmów, metadane, plakaty, gatunki |
@@ -467,11 +470,13 @@ System został zbudowany w architekturze klient–serwer z chmurowym zapleczem d
 
 ### 5.1. Opis bazy danych
 
-Baza działa w PostgreSQL (Supabase) i składa się z sześciu tabel w schemacie `public` oraz funkcji RPC. Na każdej tabeli włączony jest mechanizm Row Level Security (RLS), egzekwujący dostęp po stronie bazy. Dane o filmach nie są przechowywane w osobnej tabeli – utrwalane są jedynie referencje do TMDB (`movie_id`, `movie_title`, `poster_path`), a pełne informacje pobierane są z TMDB API.
+Baza działa w PostgreSQL (Supabase) i składa się z siedmiu tabel w schemacie `public` (sześć tabel schematu bazowego oraz dziennik moderacji) i funkcji RPC. Na każdej tabeli włączony jest mechanizm Row Level Security (RLS), egzekwujący dostęp po stronie bazy. Dane o filmach nie są przechowywane w osobnej tabeli – utrwalane są jedynie referencje do TMDB (`movie_id`, `movie_title`, `poster_path`), a pełne informacje pobierane są z TMDB API.
 
 **`profiles`** – profil użytkownika powiązany 1:1 z kontem `auth.users`.
 - `id` (UUID, PK, FK → `auth.users`, `ON DELETE CASCADE`), `email`, `display_name`, `avatar_url`, `watchlist_public` (BOOL, domyślnie `false`), `watched_public` (BOOL, domyślnie `false`), `created_at`.
-- RLS: odczyt i edycja własnego profilu; publiczny odczyt `display_name`/`avatar_url` (dla publicznych profili). Trigger `handle_new_user()` zakłada profil automatycznie po rejestracji.
+- Kolumny RBAC i moderacji: `role` (`user` / `moderator` / `admin`, domyślnie `user`), `account_status` (`active` / `muted` / `blocked`, domyślnie `active`), `muted_until` (TIMESTAMPTZ — termin wygaśnięcia kary; `NULL` przy karze na stałe).
+- `birth_date` (DATE) — data urodzenia do filtra treści wg wieku (WF-25); kolumna prywatna, dostępna wyłącznie dla właściciela przez funkcje `get_my_birth_date` / `set_my_birth_date`.
+- RLS: odczyt i edycja własnego profilu; publiczny odczyt `display_name`/`avatar_url` (dla publicznych profili). Trigger `handle_new_user()` zakłada profil automatycznie po rejestracji. **Granty kolumnowe** uzupełniają RLS: kolumn `role`, `account_status` i `muted_until` nie da się zapisać z przeglądarki (zmieniają je wyłącznie funkcje `set_user_role` / `set_account_status`), a `email` i `birth_date` nie są czytelne dla klienta.
 
 **`watchlist`** – lista „Do obejrzenia".
 - `id` (UUID, PK), `user_id` (FK → `profiles`, cascade), `movie_id` (INT, TMDB), `movie_title`, `poster_path`, `added_at`. Ograniczenie `UNIQUE(user_id, movie_id)`.
@@ -493,10 +498,22 @@ Baza działa w PostgreSQL (Supabase) i składa się z sześciu tabel w schemacie
 - `id`, `review_id` (FK, cascade), `user_id` (FK, cascade), `body` (TEXT, `CHECK char_length BETWEEN 1 AND 500`), `created_at`.
 - RLS: odczyt publiczny; dodawanie/usuwanie tylko przez autora.
 
+Moderator i Administrator mogą dodatkowo usuwać cudze recenzje i komentarze oraz zmieniać flagę spoilera (polityki RLS moderacji), a konta wyciszone lub zablokowane nie mogą publikować treści (`can_post()`).
+
+**`moderation_log`** – dziennik działań moderacji.
+- `id` (UUID, PK), `moderator_id` (FK → `profiles`, `ON DELETE SET NULL`), `target_user_id` (FK → `profiles`, cascade), `target_review_id` (UUID, bez FK — recenzja mogła zostać usunięta), `action` (np. `status:muted`, `role:moderator`, `review:delete`), `reason`, `created_at`.
+- RLS: odczyt dla Moderatora/Administratora; ukarany użytkownik widzi własne wpisy (powód kary w banerze).
+
 **Funkcje RPC:**
-- `handle_new_user()` – trigger zakładający profil po rejestracji konta.
+- `handle_new_user()` – trigger zakładający profil po rejestracji konta (wraz z datą urodzenia podaną przy rejestracji).
 - `delete_user()` – usuwa konto użytkownika wraz z kaskadowo powiązanymi danymi.
 - `movies_by_community_rating(min_rating)` – zwraca filmy, których średnia z czterech ocen (`plot`, `acting`, `music`, `effects`) jest nie mniejsza niż `min_rating`; stanowi podstawę filtra „ocena serwisu".
+- `movie_community_rating` – średnie ocen podkategorii jednego filmu (radar, WF-07); `movies_by_community_rating_multi` – filtr po czterech kryteriach i ocenie ogólnej (WF-09).
+- `user_rank_info` – rola i liczba pomocnych głosów użytkownika (rangi, WF-24).
+- `current_user_role`, `is_admin`, `is_moderator`, `can_post` – funkcje pomocnicze RBAC używane w politykach RLS.
+- `set_account_status` / `set_user_role` – zmiana statusu konta (z terminem kary) i roli z egzekwowaniem hierarchii ról w bazie oraz wpisem do dziennika moderacji.
+- `get_my_birth_date` / `set_my_birth_date` – odczyt i zapis własnej daty urodzenia (z walidacją zakresu).
+- `sweep_expired_sanctions` – zdejmuje wygasłe kary czasowe (czas z zegara bazy) i zapisuje wpis w dzienniku; wywoływana przez serwer (Vercel Cron) lub harmonogram `pg_cron`.
 
 **Integralność i bezpieczeństwo:** wszystkie tabele potomne korzystają z `ON DELETE CASCADE` – usunięcie konta kasuje jego listy, recenzje, głosy i komentarze, a usunięcie recenzji kasuje powiązane z nią głosy i komentarze. RLS gwarantuje, że użytkownik modyfikuje wyłącznie własne dane, podczas gdy recenzje, głosy i komentarze są publicznie czytelne. Klucz TMDB jest ukryty za proxy serwera, a po stronie klienta wykorzystywany jest wyłącznie publiczny klucz `anon` Supabase (zgodnie z modelem bezpieczeństwa Supabase opartym na RLS).
 

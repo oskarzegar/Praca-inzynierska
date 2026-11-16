@@ -15,6 +15,7 @@ import {
   verifyAuthToken, bearerToken, sbAdmin, sbRpcAsUser, setAuthBan,
 } from '../lib/supabaseRest.js';
 import { maybeSweepSanctions } from '../lib/sanctionSweep.js';
+import { asyncHandler } from '../lib/asyncHandler.js';
 
 const router = Router();
 
@@ -22,15 +23,33 @@ const TOKEN_INVALID    = { error: 'Nieprawidłowy lub wygasły token', code: 'to
 const ACCOUNT_STATUSES = ['active', 'muted', 'blocked'];
 const ROLES            = ['user', 'moderator', 'admin'];
 const PERMANENT_BAN    = '876000h';   // ~100 lat — blokada „na stałe"
+const UUID             = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // ── Pomocniki ───────────────────────────────────────────────────────────────
+
+// Parametr zapytania jako tekst. Parser qs zamienia ?x=a&x=b w tablicę, a ?x[k]=v
+// w obiekt — takie wartości traktujemy jak brak parametru.
+function queryText(value) {
+  return typeof value === 'string' ? value : '';
+}
+
+// ?limit=… → dodatnia liczba całkowita ograniczona do `max`; brak lub błędna wartość → domyślna.
+function limitParam(raw, fallback, max) {
+  const n = Math.trunc(Number(queryText(raw)));
+  return n > 0 ? Math.min(n, max) : fallback;
+}
+
+// Data w formacie, który rozumie zarówno JS, jak i PostgreSQL (np. ISO 8601).
+function isDateString(value) {
+  return typeof value === 'string' && !Number.isNaN(Date.parse(value));
+}
 
 function logModeration(entry) {
   return sbAdmin('POST', 'moderation_log', entry);
 }
 
 // Czas blokady logowania (format Go) dla nowego statusu; null = warstwa auth bez zmian.
-// Nietypowe `until` może rzucić wyjątek — wywoływać wewnątrz try.
+// `until` musi być wcześniej zwalidowane (isDateString).
 function authBanFor(status, until) {
   if (status === 'active') return 'none';
   if (status !== 'blocked') return null;
@@ -38,11 +57,23 @@ function authBanFor(status, until) {
   return `${Math.max(1, Math.ceil((new Date(until).getTime() - Date.now()) / 1000))}s`;
 }
 
+// RPC tokenem moderatora. Błąd sieci → { ok: false, status: 502 } — trasa odpowiada
+// wtedy jak przy awarii bazy, zamiast przerywać obsługę żądania.
+async function moderatorRpc(req, fn, args) {
+  try {
+    return await sbRpcAsUser(req.authToken, fn, args);
+  } catch (err) {
+    console.error(`[admin] RPC ${fn} — brak odpowiedzi bazy:`, err?.message || err);
+    return { ok: false, status: 502, body: null };
+  }
+}
+
 // Błąd RPC wykonanego tokenem użytkownika → odpowiedź HTTP. PostgREST zwraca 401
 // („JWT expired"), gdy token wygaśnie między middleware a RPC — klient wtedy
-// odświeża sesję i ponawia żądanie.
+// odświeża sesję i ponawia żądanie. Awaria bazy lub bramy (5xx) → 502.
 function sendRpcError(res, rpc, fallback) {
   if (rpc.status === 401) return res.status(401).json(TOKEN_INVALID);
+  if (rpc.status >= 500)  return res.status(502).json({ error: fallback });
   return res.status(rpc.status === 403 ? 403 : 400).json({ error: rpc.body?.message || fallback });
 }
 
@@ -63,7 +94,7 @@ async function fetchRole(userId) {
 
 // Usunięcie treści (recenzja / komentarz): 404 gdy nie istnieje, wpis w dzienniku moderacji.
 function removeContentRoute({ table, notFoundMessage, failureMessage, logEntry }) {
-  return async (req, res) => {
+  return asyncHandler(async (req, res) => {
     try {
       const rows = await sbAdmin('GET', `${table}?id=eq.${req.params.id}&select=user_id`);
       if (!rows.length) return res.status(404).json({ error: notFoundMessage });
@@ -74,7 +105,7 @@ function removeContentRoute({ table, notFoundMessage, failureMessage, logEntry }
     } catch (err) {
       sendAdminError(res, err, failureMessage);
     }
-  };
+  });
 }
 
 // ── Middleware RBAC ─────────────────────────────────────────────────────────
@@ -89,7 +120,7 @@ function requireServiceKey(_req, res, next) {
 
 // Middleware dopuszczające wyłącznie wskazane role.
 function requireRole(allowedRoles) {
-  return async (req, res, next) => {
+  return asyncHandler(async (req, res, next) => {
     const token = bearerToken(req);
     if (!token) return res.status(401).json({ error: 'Brak tokenu autoryzacji', code: 'token_missing' });
 
@@ -112,7 +143,7 @@ function requireRole(allowedRoles) {
     req.authToken = token;
     req.authRole  = role;
     next();
-  };
+  });
 }
 
 router.use(requireServiceKey);
@@ -120,8 +151,15 @@ router.use(requireServiceKey);
 // Na Vercel (serverless) nie ma stałego procesu z setInterval — wygasłe kary czyścimy
 // „przy okazji" ruchu w panelu (maks. raz na ~minutę na instancję), zanim panel
 // odczyta statusy kont. Błąd sweepa nigdy nie blokuje żądania.
-router.use(async (_req, _res, next) => {
+router.use(asyncHandler(async (_req, _res, next) => {
   await maybeSweepSanctions();
+  next();
+}));
+
+// Każdy :id w panelu to UUID (recenzja, komentarz, profil). Inna wartość nie może trafić
+// do ścieżki PostgREST — np. „r1&select=id" dopisałby parametry do zapytania.
+router.param('id', (_req, res, next, id) => {
+  if (!UUID.test(id)) return res.status(400).json({ error: 'Nieprawidłowy identyfikator' });
   next();
 });
 
@@ -137,10 +175,8 @@ router.get('/me', requireModerator, (req, res) => {
 const FEED_REVIEW_COLUMNS  = 'id,movie_id,movie_title,review_text,is_spoiler,created_at,user_id,profiles(display_name,avatar_url,role,account_status)';
 const FEED_COMMENT_COLUMNS = 'id,body,created_at,user_id,review_id,profiles(display_name,avatar_url)';
 
-// ?limit=… (tu oraz w /log i /users): 0 / NaN → wartość domyślna, ograniczenie tylko
-// z góry — wartość ujemna trafia do PostgREST bez zmian.
-router.get('/feed', requireModerator, async (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 20, 50);
+router.get('/feed', requireModerator, asyncHandler(async (req, res) => {
+  const limit = limitParam(req.query.limit, 20, 50);
   try {
     const [reviews, comments] = await Promise.all([
       sbAdmin('GET', `reviews?select=${FEED_REVIEW_COLUMNS}&order=created_at.desc&limit=${limit}`),
@@ -150,31 +186,30 @@ router.get('/feed', requireModerator, async (req, res) => {
   } catch (err) {
     sendAdminError(res, err, 'Błąd pobierania treści do moderacji');
   }
-});
+}));
 
 // ── 2b. GET /api/admin/log – dziennik działań moderacji ──────────────────────
 const LOG_COLUMNS = 'id,action,reason,created_at,target_review_id,'
   + 'moderator:profiles!moderator_id(id,display_name),'
   + 'target:profiles!target_user_id(id,display_name)';
 
-router.get('/log', requireModerator, async (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 80, 200);
+router.get('/log', requireModerator, asyncHandler(async (req, res) => {
+  const limit = limitParam(req.query.limit, 80, 200);
   try {
     res.json(await sbAdmin('GET', `moderation_log?select=${LOG_COLUMNS}&order=created_at.desc&limit=${limit}`));
   } catch (err) {
     sendAdminError(res, err, 'Błąd pobierania dziennika moderacji');
   }
-});
+}));
 
 // ── 3. GET /api/admin/users – lista/wyszukiwanie kont ────────────────────────
 const USER_COLUMNS = 'id,display_name,email,avatar_url,role,account_status,muted_until,created_at';
 
-router.get('/users', requireModerator, async (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 30, 100);
-  const q     = (req.query.query || '').trim();
+router.get('/users', requireModerator, asyncHandler(async (req, res) => {
+  const limit = limitParam(req.query.limit, 30, 100);
   // Znaki składni filtra PostgREST or=(…) — nawiasy, przecinek i gwiazdka (wildcard
   // ilike) — są zamieniane na spacje, by wejście nie zmieniło struktury filtra.
-  const search = q.replace(/[(),*]/g, ' ').trim();
+  const search = queryText(req.query.query).replace(/[(),*]/g, ' ').trim();
   let path = `profiles?select=${USER_COLUMNS}&order=created_at.desc&limit=${limit}`;
   if (search) {
     const pattern = encodeURIComponent(`*${search}*`);
@@ -185,7 +220,7 @@ router.get('/users', requireModerator, async (req, res) => {
   } catch (err) {
     sendAdminError(res, err, 'Błąd pobierania użytkowników');
   }
-});
+}));
 
 // ── 4. DELETE /api/admin/reviews/:id – usunięcie cudzej recenzji ─────────────
 router.delete('/reviews/:id', requireModerator, removeContentRoute({
@@ -202,7 +237,7 @@ router.delete('/reviews/:id', requireModerator, removeContentRoute({
 }));
 
 // ── 5. PATCH /api/admin/reviews/:id/spoiler – wymuszenie/zdjęcie flagi ───────
-router.patch('/reviews/:id/spoiler', requireModerator, async (req, res) => {
+router.patch('/reviews/:id/spoiler', requireModerator, asyncHandler(async (req, res) => {
   const isSpoiler = req.body?.is_spoiler === true;
   try {
     const updated = await sbAdmin('PATCH', `reviews?id=eq.${req.params.id}`, { is_spoiler: isSpoiler });
@@ -218,7 +253,7 @@ router.patch('/reviews/:id/spoiler', requireModerator, async (req, res) => {
   } catch (err) {
     sendAdminError(res, err, 'Błąd zmiany flagi spoilera');
   }
-});
+}));
 
 // ── 6. DELETE /api/admin/comments/:id – usunięcie cudzego komentarza ─────────
 router.delete('/comments/:id', requireModerator, removeContentRoute({
@@ -235,11 +270,12 @@ router.delete('/comments/:id', requireModerator, removeContentRoute({
 
 // ── 7. PATCH /api/admin/users/:id/status – wycisz / zablokuj / przywróć ──────
 // Hierarchię ról egzekwuje RPC set_account_status (auth.uid() = moderator).
-router.patch('/users/:id/status', requireModerator, async (req, res) => {
+router.patch('/users/:id/status', requireModerator, asyncHandler(async (req, res) => {
   const { status, reason, until } = req.body || {};   // until: ISO string lub null (permanentnie)
   if (!ACCOUNT_STATUSES.includes(status)) return res.status(400).json({ error: 'Nieprawidłowy status konta' });
+  if (until && !isDateString(until)) return res.status(400).json({ error: 'Nieprawidłowa data zakończenia kary' });
 
-  const rpc = await sbRpcAsUser(req.authToken, 'set_account_status', {
+  const rpc = await moderatorRpc(req, 'set_account_status', {
     p_target:      req.params.id,
     p_status:      status,
     p_reason:      reason || null,
@@ -248,23 +284,24 @@ router.patch('/users/:id/status', requireModerator, async (req, res) => {
   if (!rpc.ok) return sendRpcError(res, rpc, 'Nie udało się zmienić statusu konta');
 
   // Blokada logowania w warstwie auth: czasowa, permanentna albo zdjęcie blokady
+  const banDuration = authBanFor(status, until);
   try {
-    const banDuration = authBanFor(status, until);
     if (banDuration) await setAuthBan(req.params.id, banDuration);
-  } catch {
+  } catch (err) {
+    console.error('[admin] Blokada logowania nie powiodła się:', err?.message || err);
     return res.status(500).json({ error: 'Status zapisany, ale blokada logowania nie powiodła się' });
   }
   res.json({ ok: true, status });
-});
+}));
 
 // ── 8. PATCH /api/admin/users/:id/role – zmiana roli (tylko Admin) ───────────
-router.patch('/users/:id/role', requireAdmin, async (req, res) => {
+router.patch('/users/:id/role', requireAdmin, asyncHandler(async (req, res) => {
   const { role } = req.body || {};
   if (!ROLES.includes(role)) return res.status(400).json({ error: 'Nieprawidłowa rola' });
 
-  const rpc = await sbRpcAsUser(req.authToken, 'set_user_role', { p_target: req.params.id, p_role: role });
+  const rpc = await moderatorRpc(req, 'set_user_role', { p_target: req.params.id, p_role: role });
   if (!rpc.ok) return sendRpcError(res, rpc, 'Nie udało się zmienić roli');
   res.json({ ok: true, role });
-});
+}));
 
 export default router;

@@ -1,0 +1,9 @@
+$kind: http-request
+name: Get Age Ratings
+method: GET
+url: '{{baseUrl}}/api/movies/age-ratings'
+order: 5000
+queryParams:
+  - key: ids
+    value: '550,27205,603'
+    description: 'Comma-separated TMDB movie IDs (max 50)'

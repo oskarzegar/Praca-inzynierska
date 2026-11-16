@@ -17,8 +17,10 @@ const { validateYearRange, MIN_YEAR, maxYear } = await import('../public/assets/
 const {
   pickCertification, describeCertification, minAgeFor, ageFromBirthDate, isAllowed, ageLabel,
 } = await import('../public/assets/js/ageRatings.js');
-const { cleanEnv, cleanUrl, SB_URL, SB_ANON, verifyAuthToken, bearerToken, projectRefFromUrl } =
-  await import('../lib/supabaseRest.js');
+const {
+  cleanEnv, cleanUrl, SB_URL, SB_ANON, verifyAuthToken, bearerToken, projectRefFromUrl, sbRpcAsUser, setAuthBan,
+} = await import('../lib/supabaseRest.js');
+const { asyncHandler } = await import('../lib/asyncHandler.js');
 const { normalizeSiteUrl, resolveSiteUrl } = await import('../lib/siteUrl.js');
 const { parseIds } = await import('../lib/ageRatingsService.js');
 const { expiredSanctionsPath } = await import('../lib/sanctionSweep.js');
@@ -104,6 +106,12 @@ test('parseIds: tylko unikalne dodatnie liczby całkowite', () => {
   assert.deepEqual(parseIds(undefined), []);
 });
 
+test('parseIds: tablica z powtórzonego parametru; obiekt z parsera qs → pusta lista (bez wyjątku)', () => {
+  assert.deepEqual(parseIds(['1,2', '3']), [1, 2, 3]);
+  assert.deepEqual(parseIds({ toString: '1', valueOf: '1' }), []);
+  assert.deepEqual(parseIds(['4', { toString: '1' }]), [4]);
+});
+
 // ── Konfiguracja środowiska ─────────────────────────────────────────────────
 test('env: spacje, cudzysłowy i końcowy „/" są usuwane', () => {
   assert.equal(SB_URL, 'https://abcdefgh.supabase.co');
@@ -152,6 +160,25 @@ test('token: 401 → invalid; 404/5xx → unreachable; błąd sieci → unreacha
   assert.equal((await withFetch(async () => new Response('nf', { status: 404 }), () => verifyAuthToken('t'))).reason, 'unreachable');
   assert.equal((await withFetch(async () => { throw new Error('ECONNRESET'); }, () => verifyAuthToken('t'))).reason, 'unreachable');
   assert.equal((await verifyAuthToken(null)).reason, 'missing');
+});
+
+// ── Odporność na awarie (wcześniej: zakończenie procesu albo zignorowany błąd) ─
+test('RPC: treść, która nie jest JSON-em (np. HTML bramy), nie rzuca wyjątku', async () => {
+  const rpc = await withFetch(async () => new Response('<html>502</html>', { status: 502 }),
+    () => sbRpcAsUser('t', 'set_account_status', {}));
+  assert.deepEqual(rpc, { ok: false, status: 502, body: '<html>502</html>' });
+});
+
+test('blokada logowania: odrzucenie przez Supabase Auth → wyjątek', async () => {
+  await withFetch(async () => new Response('{}', { status: 422 }), () =>
+    assert.rejects(setAuthBan('u1', 'NaNs'), /Supabase Auth 422/));
+  await withFetch(async () => new Response('{}', { status: 200 }), () => setAuthBan('u1', '300s'));
+});
+
+test('asyncHandler: odrzucona obietnica trafia do next(err) zamiast kończyć proces', async () => {
+  const boom = new Error('boom');
+  const received = await new Promise((resolve) => asyncHandler(async () => { throw boom; })({}, {}, resolve));
+  assert.equal(received, boom);
 });
 
 // ── Sweeper kar i cron ──────────────────────────────────────────────────────

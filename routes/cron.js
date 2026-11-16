@@ -11,6 +11,7 @@ import { Router } from 'express';
 import { timingSafeEqual } from 'node:crypto';
 import { cleanEnv, bearerToken } from '../lib/supabaseRest.js';
 import { sweepExpiredSanctions } from '../lib/sanctionSweep.js';
+import { asyncHandler } from '../lib/asyncHandler.js';
 
 const router = Router();
 
@@ -42,9 +43,9 @@ function requireCronSecret(req, res, next) {
 }
 
 // GET /api/cron/sweep-sanctions — zdejmuje wygasłe kary (account_status → active, muted_until → NULL)
-router.get('/sweep-sanctions', requireCronSecret, async (_req, res) => {
+router.get('/sweep-sanctions', requireCronSecret, asyncHandler(async (_req, res) => {
   const result = await sweepExpiredSanctions();
   res.set('Cache-Control', 'no-store').status(result.ok ? 200 : 500).json(result);
-});
+}));
 
 export default router;

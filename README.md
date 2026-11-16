@@ -21,6 +21,7 @@ i analityczna działa na Supabase.
 8. [Baza danych](#baza-danych)
 9. [Bezpieczeństwo](#bezpieczeństwo)
 10. [Testy](#testy)
+11. [Słownik pojęć](#słownik-pojęć)
 
 ---
 
@@ -45,11 +46,11 @@ Nisza względem IMDb / Filmweb / Letterboxd:
 
 | Obszar | Funkcje (wymagania WF) |
 |---|---|
-| Konto / auth | rejestracja, logowanie (modal), **reset hasła** (WF-03), usunięcie konta (WF-20), awatar (WF-22), prywatność list (WF-23) |
-| Przeglądanie | przeglądanie i wyszukiwanie TMDB (WF-04), **jeden zaawansowany filtr** (rok, ocena TMDB, długość, sortowanie) (WF-05/21), **ukrywanie obejrzanych** w kategorii (WF-06), karta filmu z **radarem ocen** (WF-07) |
+| Konto / auth | rejestracja (z prywatną datą urodzenia), logowanie (modal), **reset hasła** (WF-03), usunięcie konta (WF-20), awatar (WF-22), prywatność list (WF-23) |
+| Przeglądanie | przeglądanie i wyszukiwanie TMDB (WF-04), **jeden zaawansowany filtr** (rok, ocena TMDB, długość, sortowanie) (WF-05/21), **ukrywanie obejrzanych** w kategorii (WF-06), karta filmu z **radarem ocen** (WF-07), **filtr treści wg wieku** — klasyfikacje PL/US/GB/DE/FR (WF-25) |
 | Oceny / recenzje | ocena w 4 podkategoriach (WF-08), **filtr po ocenach społeczności** (4 kryteria + ogólna) (WF-09), recenzje/komentarze (WF-10), **spoilery** (WF-11), **sortowanie recenzji** data / pomocne / ocena (WF-12) |
 | Profil | listy Obejrzane/Do obejrzenia (WF-13), **statystyki** czas + radar gatunków + bubble dekad (WF-14), **rangi** z pomocnych głosów (WF-24) |
-| Moderacja / admin | role Gość/User/Moderator/Admin (WF-15), usuwanie treści i blokady (WF-16/17), panel administratora (WF-18); **kary czasowe** (wyciszenie/blokada na czas), dziennik moderacji, informowanie ukaranego o karze |
+| Moderacja / admin | role Gość/User/Moderator/Admin (WF-15), usuwanie treści i blokady (WF-16/17), panel administratora (WF-18); **kary czasowe** (wyciszenie/blokada na czas) z **automatycznym zdejmowaniem po wygaśnięciu**, dziennik moderacji, informowanie ukaranego o karze |
 
 ## Stos technologiczny
 
@@ -60,7 +61,8 @@ Nisza względem IMDb / Filmweb / Letterboxd:
 | Frontend | statyczny **HTML + Vanilla JS** (moduły ES, bez frameworka) | interfejs; motyw jasny/ciemny w `localStorage` |
 | Wykresy | **Chart.js v4** (ładowany przez ESM z `esm.sh`) | radar, wykres bąbelkowy |
 | Auth | **Supabase Auth** | e-mail + hasło, weryfikacja, reset hasła, blokada logowania (ban) |
-| Baza | **Supabase PostgreSQL** | 6 tabel + funkcje RPC + Row Level Security |
+| Baza | **Supabase PostgreSQL** | 7 tabel + funkcje RPC + Row Level Security + granty kolumnowe |
+| Hosting | **Vercel** (funkcja serverless + Vercel Cron) lub dowolny serwer Node.js | Cron zdejmuje wygasłe kary (`vercel.json`) |
 | Magazyn plików | **Supabase Storage** (bucket `avatars`) | awatary (2 MB, JPG/PNG/WebP) |
 | Klient bazy | `@supabase/supabase-js` v2 (ESM) | komunikacja frontendu z Supabase |
 | Dane o filmach | **TMDB API** | katalog, metadane, plakaty, gatunki |
@@ -74,8 +76,10 @@ Architektura klient–serwer z chmurowym zapleczem (BaaS). **Dwie warstwy dostę
    większość odczytów. **Nie przechodzą przez Express** — ich poprawność i bezpieczeństwo
    gwarantuje wyłącznie **RLS** w bazie.
 2. **Przez REST API w Express** — wąski zakres, wyłącznie tam, gdzie potrzeba sekretu lub agregacji:
-   proxy TMDB (ukrycie klucza), `GET /stats`, `GET /recommendations`, panel administratora
-   (operacje na `service_role` po RBAC), konfiguracja klienta (`/api/config`).
+   proxy TMDB (ukrycie klucza), `GET /stats`, `GET /recommendations`, klasyfikacje wiekowe
+   (`GET /api/movies/age-ratings`, buforowane na serwerze), panel administratora (operacje na
+   `service_role` po RBAC), konfiguracja klienta (`/api/config`), diagnostyka wdrożenia
+   (`/api/health`) i zadanie cykliczne zdejmowania wygasłych kar (`/api/cron/sweep-sanctions`).
    **Udokumentowane endpointy użytkownika są wyłącznie odczytem (GET)** — żaden zapis treści nie
    idzie przez to API.
 
@@ -160,46 +164,74 @@ npm test         # testy jednostkowe (node:test)
 ### Backend (root)
 
 - **`server.js`** — punkt wejścia Express:
-  - nagłówki bezpieczeństwa (`X-Frame-Options`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`),
-  - montaż routerów: `/api/tmdb` (proxy), `/api/admin` (panel), `/api` (REST),
+  - nagłówki bezpieczeństwa (`X-Frame-Options`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `X-DNS-Prefetch-Control`),
+  - montaż routerów: `/api/tmdb` (proxy), `/api/admin` (panel), `/api/cron` (zadania cykliczne), `/api` (REST),
   - Swagger UI pod `/api/docs` + `/api/openapi.json`,
   - „ładne" trasy stron: `/film/:slug`, `/category/:slug`, `/admin`,
   - serwowanie statyki z `public/`,
-  - start cyklicznego czyszczenia wygasłych kar (`startSanctionSweep`).
-- **`swagger.js`** — specyfikacja **OpenAPI 3** (obiekt JS): filmy, profile, statystyki, rekomendacje, panel administracyjny; renderowana przez `swagger-ui-express`.
-- **`package.json`** — zależności (`express`, `dotenv`, `swagger-ui-express`) i skrypty `start` / `dev` / `test`. `"type": "module"` → cały projekt na ES Modules.
+  - **handler błędów**: błędny JSON w treści żądania, błędne kodowanie `%` w ścieżce i każdy nieobsłużony wyjątek trasy kończą się odpowiedzią JSON (`400` / `500`) bez śladu stosu — szczegóły trafiają tylko do logu serwera,
+  - start cyklicznego czyszczenia wygasłych kar (`startSanctionSweep`; na Vercel pomijany).
+- **`swagger.js`** — specyfikacja **OpenAPI 3** (obiekt JS) wszystkich endpointów: filmy, klasyfikacje wiekowe, profile, statystyki, rekomendacje, panel administracyjny, proxy TMDB, cron, diagnostyka; renderowana przez `swagger-ui-express`.
+- **`package.json`** — zależności (`express`, `dotenv`, `swagger-ui-express`) i skrypty `start` / `dev` / `test` / `lint` / `check` (lint + testy) / `test:security`. `"type": "module"` → cały projekt na ES Modules.
+- **`vercel.json`** — harmonogram **Vercel Cron**: codzienne wywołanie `/api/cron/sweep-sanctions` (zabezpieczone `CRON_SECRET`).
+- **`.env.example`** — wzór zmiennych środowiskowych (opis w sekcji „Konfiguracja i uruchomienie").
 
 ### `lib/` — współdzielona warstwa serwera
 
-- **`supabaseRest.js`** — wspólne wywołania REST/Auth Supabase (eliminują duplikację między routerami):
+Podział warstw: **`routes/`** obsługuje wyłącznie przepływ HTTP (walidacja → zapytania → odpowiedź),
+**logika biznesowa** jest w modułach `lib/`, a **jedynymi modułami wysyłającymi zapytania** do Supabase
+i TMDB są `supabaseRest.js` i `tmdb.js`.
+
+*Dostęp do danych*
+- **`supabaseRest.js`** — jedyne miejsce zapytań do Supabase (PostgREST + Auth); adres i klucze z env, oczyszczone ze spacji, cudzysłowów i końcowego „/":
   - `sbFetch` — odczyt kluczem `anon` (RLS roli anonimowej),
   - `sbFetchAsUser` — odczyt tokenem użytkownika (RLS zalogowanego),
-  - `getAuthUser` — weryfikacja tokenu JWT → obiekt użytkownika,
-  - `sbAdmin` — zapytania kluczem `service_role` (omija RLS, **tylko po autoryzacji RBAC**),
-  - `sbRpcAsUser` — wywołanie RPC w kontekście użytkownika (reguły bazy egzekwowane).
+  - `sbAdmin` — zapytania kluczem `service_role` (omija RLS; operacje panelu po RBAC, odczyt roli w RBAC, czyszczenie kar),
+  - `sbRpcAsUser` / `sbRpcAdmin` — wywołanie RPC tokenem użytkownika (reguły bazy egzekwowane) / kluczem `service_role`; treść odpowiedzi, która nie jest JSON-em, wraca jako tekst,
+  - `verifyAuthToken` — weryfikacja tokenu JWT z **rozróżnieniem przyczyny** (brak / nieprawidłowy / błąd konfiguracji / Supabase nieosiągalny); `getAuthUser` — skrót zwracający użytkownika,
+  - `setAuthBan` — blokada logowania w Supabase Auth (Admin API); odrzucenie przez Supabase zgłasza błąd,
+  - pomocniki `cleanEnv` / `cleanUrl`, `bearerToken`, `projectRefFromKey` / `projectRefFromUrl` (diagnostyka `/api/health`).
 - **`tmdb.js`** — dostęp do TMDB z zabezpieczeniami:
   - `isAllowedTmdbPath` — **whitelist** ścieżek (`/movie`, `/discover`, `/search`, `/trending`, `/genre`),
-  - cache **TTL** w pamięci (10 min) — ogranicza liczbę zapytań,
-  - timeout (`AbortController`),
-  - `tmdbProxy` (dla proxy, zwraca status) i `tmdbFetch` (dla API, rzuca z `.status`).
-- **`sanctionSweep.js`** — cykliczne (co 60 s) czyszczenie **wygasłych kar czasowych**: resetuje `account_status → 'active'` i `muted_until → NULL` kluczem `service_role`. Kary permanentne (`muted_until = NULL`) są pomijane.
+  - wspólny cache **TTL** w pamięci (10 min, maks. 500 wpisów) dla proxy i wywołań serwerowych,
+  - **limit czasu 8 s** (`AbortController`) na całe zapytanie — także na odczyt treści odpowiedzi,
+  - `tmdbProxy` (dla proxy, zwraca status TMDB), `tmdbFetch` (dla API, rzuca błąd z `.status`) i `tmdbFailure` (mapowanie błędu na `504` timeout / `502`).
+
+*Logika biznesowa*
+- **`watchStats.js`** — statystyki oglądania (WF-14): metadane filmów z TMDB, łączny czas, rozkład gatunków i dekad (limit 250 filmów).
+- **`recommendations.js`** — rekomendacje: wykluczenia (ostatnio obejrzane i lista do obejrzenia), dobór filmów źródłowych (najwyżej ocenione + ostatnio obejrzane, maks. 5), scalanie i ranking `vote_average · log10(vote_count + 10)`, maks. 20 wyników.
+- **`ageRatingsService.js`** — klasyfikacje wiekowe wielu filmów naraz (z TMDB `release_dates`): własny cache 24 h (do 5000 wpisów, „film nie istnieje" — 1 h), maks. 6 równoległych zapytań, maks. 50 ID w żądaniu.
+- **`sanctionSweep.js`** — zdejmowanie **wygasłych kar czasowych** (`account_status → 'active'`, `muted_until → NULL`; kary permanentne pomijane). Preferuje funkcję bazy `sweep_expired_sanctions()`, a gdy jej brak — równoważny PATCH kluczem `service_role`. Trzy wyzwalacze: Vercel Cron (`/api/cron/sweep-sanctions`), sweep „leniwy" przed żądaniami panelu admina (maks. raz na ~minutę) oraz timer co 60 s przy klasycznym serwerze.
+
+*Pomocniki*
+- **`ttlCache.js`** — cache w pamięci z czasem życia wpisów i limitem rozmiaru (wspólny dla TMDB i klasyfikacji wiekowych).
+- **`rateLimit.js`** — limiter per-IP z oknem przesuwnym i wagą żądania (`cost`), okresowo usuwa nieaktywne adresy IP.
+- **`siteUrl.js`** — publiczny adres aplikacji dla linków w e-mailach auth (`SITE_URL` → domena produkcyjna Vercel → `null`).
+- **`asyncHandler.js`** — przekazuje błędy handlerów `async` do obsługi błędów Express (Express 4 sam tego nie robi — nieobsłużony wyjątek kończyłby proces).
 
 ### `routes/` — REST API
 
-- **`tmdb.js`** — proxy TMDB: rate limit per-IP (600/min), whitelist + cache + timeout (z `lib/tmdb.js`). Klucz API doklejany po stronie serwera.
+Pełny opis endpointów (parametry, odpowiedzi, kody błędów): Swagger UI pod `/api/docs`.
+
+- **`tmdb.js`** — proxy TMDB: rate limit per-IP (600/min, `429` bez `Retry-After`), whitelist + cache + timeout (z `lib/tmdb.js`). Klucz API doklejany po stronie serwera.
 - **`api.js`** — główne API:
-  - `GET /api/config` — URL + klucz `anon` dla klienta,
+  - `GET /api/config` — URL + klucz `anon` + publiczny adres aplikacji dla klienta,
+  - `GET /api/health` — diagnostyka konfiguracji wdrożenia (flagi, bez sekretów),
   - `GET /api/movies/popular | /search | /:id | /:id/reviews`,
+  - `GET /api/movies/age-ratings?ids=…` — klasyfikacje wiekowe do 50 filmów naraz (limit 1500 ID/min na IP),
   - `GET /api/profiles/:id` + `/watchlist` + `/watched` (respektują prywatność),
   - `GET /api/profiles/:id/stats` — **statystyki WF-14** (czas oglądania, gatunki, dekady) liczone z `watched` + TMDB,
   - `GET /api/recommendations` — agregacja rekomendacji TMDB z personalizowanym doborem źródeł (tożsamość z tokenu JWT),
-  - spójna obsługa błędów (mapowanie 404/timeout, logowanie).
+  - spójna obsługa błędów: `404` z TMDB, `502` / `504` przy awarii lub timeoucie TMDB, `500` przy błędzie bazy (z wpisem w logu).
 - **`admin.js`** — panel moderacji/admina, **RBAC po stronie serwera**:
-  - middleware `requireRole(['moderator','admin'])` / `requireAdmin`,
+  - middleware `requireRole(['moderator','admin'])` / `requireAdmin`; odrzucony token → `401` (klient odświeża sesję i ponawia), błąd konfiguracji lub sieci serwera → `503`,
   - `GET /me`, `/feed` (ostatnie treści), `/log` (dziennik), `/users` (lista/szukanie),
   - `DELETE /reviews/:id`, `/comments/:id`; `PATCH /reviews/:id/spoiler`,
-  - `PATCH /users/:id/status` (wycisz/blokuj/przywróć + czas trwania) i `/users/:id/role`,
-  - operacje przez `service_role` **dopiero po** weryfikacji uprawnień; reguły hierarchii ról dodatkowo w bazie.
+  - `PATCH /users/:id/status` (wycisz/blokuj/przywróć + czas trwania, blokada logowania w Supabase Auth) i `/users/:id/role`,
+  - **walidacja wejścia**: `:id` musi być UUID (inaczej `400` — nic nie trafia do bazy), `limit` to dodatnia liczba całkowita (inaczej wartość domyślna), parametry zapytania inne niż tekst są ignorowane, `until` musi być poprawną datą,
+  - awaria bazy przy zmianie statusu lub roli → `502`; status zapisany, ale blokada logowania odrzucona → `500` z komunikatem,
+  - operacje przez `service_role` **dopiero po** weryfikacji uprawnień (wyjątek: sweep wygasłych kar przed RBAC); zmiany statusu i roli idą tokenem moderatora, a hierarchię ról egzekwuje dodatkowo baza.
+- **`cron.js`** — `GET /api/cron/sweep-sanctions` dla Vercel Cron: wymaga nagłówka `Authorization: Bearer <CRON_SECRET>` (bez skonfigurowanego sekretu — `503`), zwraca `{ ok, cleared, via }`.
 
 ### Baza danych (`db/`)
 
@@ -210,6 +242,9 @@ npm test         # testy jednostkowe (node:test)
 - **`40_user_ranks.sql`** — `user_rank_info` (rola + suma pomocnych głosów → rangi, WF-24).
 - **`50_sanction_duration.sql`** — kary czasowe: `muted_until` także dla `blocked`; `can_post()` auto-wygasa karę.
 - **`60_self_sanction_visibility.sql`** — polityka RLS: użytkownik czyta **własne** wpisy `moderation_log` (powód kary w banerze).
+- **`70_security_fixes.sql`** — **krytyczne** granty kolumnowe: `role` / `account_status` / `muted_until` niezapisywalne z przeglądarki, `email` nieczytelny dla klienta, awatary tylko we własnym folderze Storage.
+- **`80_age_restrictions.sql`** — prywatna kolumna `profiles.birth_date` (bez grantów dla klienta), RPC `get_my_birth_date` / `set_my_birth_date`, zapis daty z rejestracji w triggerze `handle_new_user` (WF-25).
+- **`90_sanction_sweep.sql`** — funkcja `sweep_expired_sanctions()` (zdejmuje wygasłe kary wg zegara bazy, wpis w dzienniku) + opcjonalny harmonogram `pg_cron` co minutę.
 - **`README.md`** — kolejność migracji i model uprawnień.
 
 ### Frontend — strony HTML (`public/`)
@@ -234,6 +269,9 @@ Każda strona ma wspólny nagłówek (logo, wyszukiwarka-lupa, menu) i ładuje `
 - **`search.js`** — **jeden zaawansowany system wyszukiwania** w modalu otwieranym lupą: tytuł + rok + ocena TMDB + długość + sortowanie + **4 kryteria ocen społeczności**.
 - **`movie-card.js`** — komponent karty filmu (poster, tytuł, ocena TMDB + społeczności).
 - **`communityRatings.js`** — wsadowe ładowanie i cache średnich ocen społeczności (badge na kartach).
+- **`yearRange.js`** — walidacja zakresu lat w wyszukiwarce (TMDB ignoruje lata spoza obsługiwanego zakresu i zwraca wtedy wszystkie filmy).
+- **`ageRatings.js`** — klasyfikacje wiekowe (czyste funkcje, współdzielone z serwerem): wybór klasyfikacji (PL, potem US/GB/DE/FR), minimalny wiek, etykiety i opisy.
+- **`ageGate.js`** — filtr treści wg wieku (WF-25): wiek z prywatnej daty urodzenia, klasyfikacje pobierane paczkami z `/api/movies/age-ratings`, blokowanie niedozwolonych kart filmów; przy nieznanym wieku blokowane są tylko treści 18+.
 
 **Konto i moderacja**
 - **`auth.js`** — modal konta: logowanie, rejestracja, reset hasła, edycja profilu, awatar, prywatność list, usunięcie konta, link do panelu (dla Mod/Admin), wpięcie banera kary.
@@ -257,18 +295,20 @@ Każda strona ma wspólny nagłówek (logo, wyszukiwarka-lupa, menu) i ładuje `
 
 ### Pozostałe
 - **`public/assets/css/style.css`** — pełny styl aplikacji (motyw jasny/ciemny przez zmienne CSS, responsywność, komponenty: karty, modale, wykresy, panele, banery).
-- **`test/unit.test.js`** — testy jednostkowe (`node:test`): `slugify` (w tym edge case ł/Ł), `movieUrl`, `escapeHtml`/`escapeAttr`.
+- **`test/unit.test.js`** — testy jednostkowe (`node:test`): `slugify` (w tym edge case ł/Ł), `movieUrl`, `escapeHtml`/`escapeAttr`, whitelist proxy `isAllowedTmdbPath`.
+- **`test/fixes.test.js`** — testy poprawek (`node:test`): walidacja zakresu lat, klasyfikacje wiekowe, `parseIds`, oczyszczanie zmiennych env, adres witryny, weryfikacja tokenu, sweeper kar, autoryzacja crona oraz odporność na awarie (RPC z treścią nie-JSON, odrzucona blokada logowania, `asyncHandler`).
+- **`scripts/check-syntax.mjs`** — kontrola składni wszystkich plików JS (`npm run lint`); **`scripts/security-check.mjs`** — test napastniczy RLS i uprawnień (`npm run test:security`).
 
 ---
 
 ## Baza danych
 
-6 tabel w schemacie `public`, na każdej włączony **RLS**. Dane o filmach nie mają własnej tabeli —
+7 tabel w schemacie `public`, na każdej włączony **RLS**. Dane o filmach nie mają własnej tabeli —
 utrwalane są referencje do TMDB (`movie_id`, `movie_title`, `poster_path`).
 
 | Tabela | Rola |
 |---|---|
-| `profiles` | profil 1:1 z `auth.users`; `role`, `account_status`, `muted_until`, prywatność list, awatar |
+| `profiles` | profil 1:1 z `auth.users`; `role`, `account_status`, `muted_until`, prywatność list, awatar, prywatna `birth_date` |
 | `watchlist` / `watched` | listy „Do obejrzenia" / „Obejrzane" (`UNIQUE(user_id, movie_id)`) |
 | `reviews` | recenzje z 4 ocenami 1–5 + `is_spoiler` (`UNIQUE(user_id, movie_id)`) |
 | `review_votes` | głosy „pomocne" (podstawa rang) |
@@ -277,7 +317,8 @@ utrwalane są referencje do TMDB (`movie_id`, `movie_title`, `poster_path`).
 
 **Kluczowe funkcje RPC:** `movies_by_community_rating`, `movie_community_rating`,
 `movies_by_community_rating_multi`, `user_rank_info`, `set_account_status`, `set_user_role`,
-`can_post`, `is_admin`/`is_moderator`/`current_user_role`, `handle_new_user`, `delete_user`.
+`can_post`, `is_admin`/`is_moderator`/`current_user_role`, `handle_new_user`, `delete_user`,
+`get_my_birth_date`/`set_my_birth_date`, `sweep_expired_sanctions`.
 
 ## Bezpieczeństwo
 
@@ -300,7 +341,13 @@ utrwalane są referencje do TMDB (`movie_id`, `movie_title`, `poster_path`).
   escapowane (`utils.js`) przed wstawieniem do `innerHTML`. `avatar_url` trafia wyłącznie do
   atrybutu `src` obrazka przez `escapeAttr` (nie do `href`), więc wektor `javascript:` nie wchodzi.
 - **Klucz TMDB** ukryty za proxy: whitelist ścieżek, rate limit per-IP, cache, timeout.
-- **Klucz `service_role`** używany wyłącznie po stronie serwera, po sprawdzeniu uprawnień.
+- **Klucz `service_role`** używany wyłącznie po stronie serwera: w panelu po sprawdzeniu uprawnień,
+  a poza panelem tylko w zadaniu zdejmowania wygasłych kar (cron chroniony `CRON_SECRET`, timer, sweep leniwy).
+- **Walidacja wejścia panelu**: identyfikatory w ścieżce muszą być UUID (nie da się dopisać parametrów
+  do zapytania PostgREST), parametry zapytania inne niż tekst są ignorowane, termin kary musi być poprawną datą.
+- **Odporność serwera**: wyjątek w trasie nie kończy procesu (`asyncHandler` + handler błędów), awaria bazy
+  lub TMDB daje odpowiedź `502` / `504`, a zapytania do TMDB mają limit czasu 8 s.
+- **Brak wycieku szczegółów**: błędy są zwracane jako JSON bez śladu stosu i ścieżek plików.
 - Nagłówki bezpieczeństwa ustawiane w `server.js` (`trust proxy` włączony dla poprawnego `req.ip`).
 
 **Świadome ograniczenia** (do uczciwego omówienia na obronie):
@@ -309,6 +356,8 @@ utrwalane są referencje do TMDB (`movie_id`, `movie_title`, `poster_path`).
   `image.tmdb.org`, YouTube) i nonce dla inline'owego skryptu motywu.
 - **Rate limiter** proxy TMDB jest **w pamięci procesu** (stan znika po restarcie, nie współdzieli się
   między instancjami) — wystarczający dla pojedynczej instancji/demo, do skalowania wymagałby np. Redisa.
+- **Usunięcie treści przez moderatora i wpis w dzienniku** to dwa osobne zapytania, a nie jedna transakcja —
+  przy awarii między nimi treść zniknie bez wpisu. Pełna atomowość wymagałaby funkcji RPC w bazie.
 
 ## Testy
 
@@ -319,7 +368,9 @@ npm run test:security   # test napastniczy RLS/uprawnień (wymaga .env + sieci)
 ```
 
 - **Jednostkowe** (`node:test`) — czyste funkcje: `slugify` (edge case polskich ł/Ł), `movieUrl`,
-  escapowanie `escapeHtml`/`escapeAttr` oraz whitelist proxy `isAllowedTmdbPath`.
+  escapowanie `escapeHtml`/`escapeAttr` oraz whitelist proxy `isAllowedTmdbPath` (`test/unit.test.js`);
+  poprawki i odporność serwera — zakres lat, klasyfikacje wiekowe, konfiguracja env, weryfikacja tokenu
+  (z atrapą `fetch`), sweeper kar, cron, obsługa awarii RPC i blokady logowania (`test/fixes.test.js`).
 - **Napastniczy** ([`scripts/security-check.mjs`](./scripts/security-check.mjs)) — tworzy konto
   testowe i próbuje eskalacji roli, zmiany własnej kary oraz wycieku e-maili; po `db/70` wszystkie
   próby muszą zostać odrzucone (na końcu sprząta konto). Pozostaje poza `npm test`, bo wymaga sieci.
@@ -352,4 +403,7 @@ npm run test:security   # test napastniczy RLS/uprawnień (wymaga .env + sieci)
 | **Spoiler** | Recenzja zdradzająca fabułę — oznaczana flagą `is_spoiler` i ukrywana z ostrzeżeniem (WF-11). |
 | **Ranga** | Tytuł nadawany z liczby **pomocnych głosów** (Widz → Recenzent → Krytyk → Ekspert → Filmoznawca, WF-24). |
 | **Kara czasowa** | Wyciszenie (blokada publikowania) lub blokada (także logowania) na czas określony lub na stałe; po wygaśnięciu konto wraca do `active`. |
+| **Cron / Vercel Cron** | Zadanie uruchamiane cyklicznie według harmonogramu. Tu: Vercel wywołuje `/api/cron/sweep-sanctions` (z sekretem `CRON_SECRET`), a ten zdejmuje wygasłe kary czasowe. |
+| **Klasyfikacja wiekowa** | Oznaczenie minimalnego wieku widza (np. PL `16`, US `PG-13`) z TMDB; podstawa filtra treści wg wieku (WF-25). |
+| **UUID** | Losowy, 128-bitowy identyfikator rekordów w bazie (np. recenzji, profilu). Panel admina przyjmuje w ścieżce wyłącznie poprawne UUID. |
 | **Hashowanie hasła** | Przechowywanie hasła wyłącznie jako nieodwracalny skrót (po stronie Supabase Auth) — nigdy jako tekst jawny. |

@@ -1,0 +1,9 @@
+$kind: http-request
+name: Get Watch Stats
+method: GET
+url: '{{baseUrl}}/api/profiles/:id/stats'
+order: 4000
+pathVariables:
+  - key: id
+    value: '{{userId}}'
+    description: User UUID (public watched list, or the owner's own profile with a Bearer token)

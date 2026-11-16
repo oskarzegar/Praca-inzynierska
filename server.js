@@ -66,6 +66,16 @@ for (const [route, file] of Object.entries(PAGES)) {
 // Pozostałe pliki frontendu
 app.use(express.static(PUBLIC_DIR));
 
+// Błędy przekazane do next(err): błędny JSON w body, błędne kodowanie „%" w ścieżce,
+// nieobsłużony wyjątek trasy. Klient dostaje JSON bez śladu stosu i ścieżek plików;
+// szczegóły błędów serwera (5xx) trafiają tylko do logu.
+app.use((err, _req, res, next) => {
+  if (res.headersSent) return next(err);
+  const status = err.status || err.statusCode || 500;
+  if (status >= 500) console.error('[server] Nieobsłużony błąd:', err);
+  res.status(status).json({ error: status >= 500 ? 'Wewnętrzny błąd serwera' : 'Nieprawidłowe żądanie' });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Serwer działa na http://localhost:${PORT}`);

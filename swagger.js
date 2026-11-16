@@ -2,30 +2,115 @@ export const swaggerSpec = {
   openapi: '3.0.3',
   info: {
     title: 'Projekt Filmy – REST API',
-    version: '1.0.0',
+    version: '1.1.0',
     description:
-      'Publiczne API serwisu filmowego. Umożliwia pobieranie danych o filmach (TMDB), ' +
-      'recenzjach, profilach użytkowników oraz ich listach filmowych.',
+      'API serwisu filmowego: dane o filmach (TMDB), recenzje, profile użytkowników i ich listy, ' +
+      'statystyki oglądania, rekomendacje, klasyfikacje wiekowe oraz panel moderacji. ' +
+      'Każdy błąd jest zwracany jako JSON `{ "error": "…" }` (w panelu admina czasem także pole `code`); ' +
+      'serwer nie ujawnia śladów stosu ani ścieżek plików. Błędny JSON w treści żądania → 400.',
   },
   servers: [{ url: 'http://localhost:3000', description: 'Lokalny serwer deweloperski' }],
   tags: [
-    { name: 'Filmy',         description: 'Dane filmowe pobierane z TMDB' },
-    { name: 'Profile',       description: 'Profile użytkowników i ich listy' },
-    { name: 'Konfiguracja',  description: 'Publiczna konfiguracja klienta' },
-    { name: 'Administracja', description: 'Panel moderacji i administracji (RBAC, wymaga roli Moderator/Admin)' },
+    { name: 'Filmy',           description: 'Dane filmowe pobierane z TMDB' },
+    { name: 'Profile',         description: 'Profile użytkowników i ich listy' },
+    { name: 'Konfiguracja',    description: 'Publiczna konfiguracja klienta i diagnostyka wdrożenia' },
+    { name: 'Administracja',   description: 'Panel moderacji i administracji (RBAC, wymaga roli Moderator/Admin)' },
+    { name: 'Proxy TMDB',      description: 'Pośrednik do TMDB — klucz API doklejany po stronie serwera' },
+    { name: 'Zadania serwera', description: 'Zadania cykliczne wywoływane przez Vercel Cron' },
   ],
   paths: {
     '/api/config': {
       get: {
         tags: ['Konfiguracja'],
         summary: 'Konfiguracja publiczna',
-        description: 'Zwraca URL i klucz anonimowy Supabase potrzebne do inicjalizacji klienta w przeglądarce.',
+        description:
+          'Zwraca URL i klucz anonimowy Supabase potrzebne do inicjalizacji klienta w przeglądarce ' +
+          'oraz publiczny adres aplikacji dla linków w e-mailach auth.',
         responses: {
           200: {
             description: 'Dane konfiguracyjne',
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/Config' },
+              },
+            },
+          },
+        },
+      },
+    },
+
+    '/api/health': {
+      get: {
+        tags: ['Konfiguracja'],
+        summary: 'Diagnostyka konfiguracji wdrożenia',
+        description:
+          'Sprawdza konfigurację serwera bez ujawniania sekretów: czy ustawiono zmienne środowiskowe, ' +
+          'czy SUPABASE_URL ma poprawny format, czy klucze należą do tego samego projektu Supabase ' +
+          'i czy wartości wymagały oczyszczenia (spacje, cudzysłowy, końcowy „/").',
+        responses: {
+          200: {
+            description: 'Stan konfiguracji (odpowiedź z nagłówkiem Cache-Control: no-store)',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Health' },
+              },
+            },
+          },
+        },
+      },
+    },
+
+    '/api/movies/age-ratings': {
+      get: {
+        tags: ['Filmy'],
+        summary: 'Klasyfikacje wiekowe wielu filmów',
+        description:
+          'Zwraca klasyfikację wiekową (PL, a gdy jej brak — US, GB, DE, FR) dla maks. 50 filmów naraz. ' +
+          'Wyniki są buforowane na serwerze (24 h; „film nie istnieje" — 1 h). Limit: 1500 ID na minutę na adres IP. ' +
+          'Wartość null przy ID oznacza, że nie udało się sprawdzić klasyfikacji (można ponowić).',
+        parameters: [
+          {
+            name: 'ids',
+            in: 'query',
+            required: true,
+            description: 'Identyfikatory TMDB oddzielone przecinkami (maks. 50; duplikaty i niepoprawne wartości są pomijane)',
+            schema: { type: 'string', example: '550,27205,603' },
+          },
+        ],
+        responses: {
+          200: {
+            description:
+              'Klasyfikacje. Cache-Control: public, max-age=3600 — albo no-store, gdy dla części ID sprawdzenie się nie powiodło.',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    ratings: {
+                      type: 'object',
+                      additionalProperties: { allOf: [{ $ref: '#/components/schemas/AgeRating' }], nullable: true },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          400: {
+            description: 'Brak poprawnych ID',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Error' },
+                example: { error: 'Parametr ids jest wymagany (maks. 50 liczb oddzielonych przecinkami)' },
+              },
+            },
+          },
+          429: { $ref: '#/components/responses/TooManyRequests' },
+          502: {
+            description: 'TMDB nie odpowiada dla żadnego z filmów',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Error' },
+                example: { error: 'TMDB nie odpowiada — nie udało się sprawdzić klasyfikacji' },
               },
             },
           },
@@ -55,7 +140,9 @@ export const swaggerSpec = {
               },
             },
           },
-          500: { $ref: '#/components/responses/ServerError' },
+          404: { $ref: '#/components/responses/TmdbNotFound' },
+          502: { $ref: '#/components/responses/TmdbError' },
+          504: { $ref: '#/components/responses/TmdbTimeout' },
         },
       },
     },
@@ -98,7 +185,9 @@ export const swaggerSpec = {
               },
             },
           },
-          500: { $ref: '#/components/responses/ServerError' },
+          404: { $ref: '#/components/responses/TmdbNotFound' },
+          502: { $ref: '#/components/responses/TmdbError' },
+          504: { $ref: '#/components/responses/TmdbTimeout' },
         },
       },
     },
@@ -107,7 +196,7 @@ export const swaggerSpec = {
       get: {
         tags: ['Filmy'],
         summary: 'Szczegóły filmu',
-        description: 'Zwraca pełne informacje o filmie: opis, obsada, zwiastuny, gatunki.',
+        description: 'Zwraca pełne informacje o filmie: opis, obsada i ekipa (credits), zwiastuny (videos), gatunki.',
         parameters: [
           {
             name: 'id',
@@ -126,7 +215,9 @@ export const swaggerSpec = {
               },
             },
           },
-          500: { $ref: '#/components/responses/ServerError' },
+          404: { $ref: '#/components/responses/TmdbNotFound' },
+          502: { $ref: '#/components/responses/TmdbError' },
+          504: { $ref: '#/components/responses/TmdbTimeout' },
         },
       },
     },
@@ -169,7 +260,9 @@ export const swaggerSpec = {
         description:
           'Agregacja rekomendacji TMDB z personalizowanym doborem filmów źródłowych ' +
           '(na podstawie ocen i historii oglądania) oraz własnym rankingiem. Wyklucza filmy ' +
-          'już obejrzane/na watchliście. Tożsamość użytkownika wynika z tokenu JWT (nie z parametru).',
+          'ostatnio obejrzane (30 najnowszych) i zapisane na liście do obejrzenia; maks. 20 wyników. ' +
+          'Tożsamość użytkownika wynika z tokenu JWT (nie z parametru). Niedostępne pojedyncze źródło ' +
+          'TMDB nie przerywa odpowiedzi (jest pomijane i logowane).',
         security: [{ BearerAuth: [] }],
         responses: {
           200: {
@@ -189,7 +282,7 @@ export const swaggerSpec = {
             },
           },
           401: {
-            description: 'Brak tokenu autoryzacji',
+            description: 'Brak tokenu („Brak tokenu autoryzacji") albo token nieprawidłowy lub wygasły („Nieprawidłowy lub wygasły token")',
             content: {
               'application/json': {
                 schema: { $ref: '#/components/schemas/Error' },
@@ -246,19 +339,23 @@ export const swaggerSpec = {
         description:
           'Liczy w locie czas oglądania, rozkład gatunków i dekad na podstawie listy obejrzanych ' +
           'i danych TMDB. Własne statystyki widzi właściciel (token JWT); cudze tylko gdy lista ' +
-          'obejrzanych jest publiczna.',
+          'obejrzanych jest publiczna. Liczonych jest maks. 250 filmów; film, którego danych nie udało ' +
+          'się pobrać z TMDB, jest pomijany (wtedy incomplete = true).',
+        security: [{}, { BearerAuth: [] }],
         parameters: [
           { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
         ],
         responses: {
           200: {
-            description: 'Zagregowane statystyki',
+            description: 'Zagregowane statystyki (przy pustej liście: tylko watchedCount, totalRuntimeMinutes, genres, decades)',
             content: {
               'application/json': {
                 schema: {
                   type: 'object',
                   properties: {
-                    watchedCount:        { type: 'integer' },
+                    watchedCount:        { type: 'integer', description: 'Liczba filmów na liście obejrzanych' },
+                    moviesCounted:       { type: 'integer', description: 'Ile filmów faktycznie policzono' },
+                    incomplete:          { type: 'boolean', description: 'true, gdy części danych TMDB nie udało się pobrać' },
                     totalRuntimeMinutes: { type: 'integer' },
                     genres:  { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, count: { type: 'integer' } } } },
                     decades: { type: 'array', items: { type: 'object', properties: { decade: { type: 'integer' }, count: { type: 'integer' } } } },
@@ -267,8 +364,14 @@ export const swaggerSpec = {
               },
             },
           },
-          403: { description: 'Statystyki są prywatne' },
-          404: { description: 'Profil nie znaleziony' },
+          403: {
+            description: 'Statystyki są prywatne',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, example: { error: 'Statystyki są prywatne' } } },
+          },
+          404: {
+            description: 'Profil nie znaleziony',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, example: { error: 'Profil nie znaleziony' } } },
+          },
           500: { $ref: '#/components/responses/ServerError' },
         },
       },
@@ -280,14 +383,13 @@ export const swaggerSpec = {
         summary: 'Ostatnie treści do moderacji',
         description: 'Zwraca ostatnio dodane recenzje i komentarze. Wymaga roli Moderator lub Admin.',
         security: [{ BearerAuth: [] }],
-        parameters: [
-          { name: 'limit', in: 'query', schema: { type: 'integer', default: 20, maximum: 50 } },
-        ],
+        parameters: [{ $ref: '#/components/parameters/FeedLimit' }],
         responses: {
-          200: { description: 'Recenzje i komentarze' },
-          401: { description: 'Brak/nieprawidłowy token' },
-          403: { description: 'Brak wymaganych uprawnień' },
-          503: { description: 'Panel nieskonfigurowany (brak service role key)' },
+          200: { description: '{ reviews, comments } — po `limit` najnowszych pozycji' },
+          401: { $ref: '#/components/responses/AdminUnauthorized' },
+          403: { $ref: '#/components/responses/AdminForbidden' },
+          500: { $ref: '#/components/responses/AdminServerError' },
+          503: { $ref: '#/components/responses/AdminUnavailable' },
         },
       },
     },
@@ -300,8 +402,10 @@ export const swaggerSpec = {
         security: [{ BearerAuth: [] }],
         responses: {
           200: { description: '{ id, role }' },
-          401: { description: 'Brak/nieprawidłowy token' },
-          403: { description: 'Brak wymaganych uprawnień' },
+          401: { $ref: '#/components/responses/AdminUnauthorized' },
+          403: { $ref: '#/components/responses/AdminForbidden' },
+          500: { $ref: '#/components/responses/AdminServerError' },
+          503: { $ref: '#/components/responses/AdminUnavailable' },
         },
       },
     },
@@ -313,12 +417,18 @@ export const swaggerSpec = {
         description: 'Ostatnie wpisy z moderation_log (kto, kogo, jaka akcja, powód). Wymaga Moderator/Admin.',
         security: [{ BearerAuth: [] }],
         parameters: [
-          { name: 'limit', in: 'query', schema: { type: 'integer', default: 80, maximum: 200 } },
+          {
+            name: 'limit', in: 'query',
+            description: 'Liczba wpisów: dodatnia liczba całkowita, maks. 200; brak lub inna wartość → 80',
+            schema: { type: 'integer', default: 80, minimum: 1, maximum: 200 },
+          },
         ],
         responses: {
           200: { description: 'Lista wpisów dziennika' },
-          401: { description: 'Brak/nieprawidłowy token' },
-          403: { description: 'Brak wymaganych uprawnień' },
+          401: { $ref: '#/components/responses/AdminUnauthorized' },
+          403: { $ref: '#/components/responses/AdminForbidden' },
+          500: { $ref: '#/components/responses/AdminServerError' },
+          503: { $ref: '#/components/responses/AdminUnavailable' },
         },
       },
     },
@@ -330,13 +440,25 @@ export const swaggerSpec = {
         description: 'Konta wraz z rolą i statusem. Opcjonalne wyszukiwanie po nazwie lub e-mailu.',
         security: [{ BearerAuth: [] }],
         parameters: [
-          { name: 'query', in: 'query', description: 'Fraza (nazwa lub e-mail)', schema: { type: 'string' } },
-          { name: 'limit', in: 'query', schema: { type: 'integer', default: 30, maximum: 100 } },
+          {
+            name: 'query', in: 'query',
+            description:
+              'Fraza (nazwa lub e-mail, bez rozróżniania wielkości liter). Znaki ( ) , * są zamieniane na spacje; ' +
+              'powtórzony parametr lub wartość w formie obiektu są ignorowane.',
+            schema: { type: 'string' },
+          },
+          {
+            name: 'limit', in: 'query',
+            description: 'Liczba kont: dodatnia liczba całkowita, maks. 100; brak lub inna wartość → 30',
+            schema: { type: 'integer', default: 30, minimum: 1, maximum: 100 },
+          },
         ],
         responses: {
           200: { description: 'Lista kont' },
-          401: { description: 'Brak/nieprawidłowy token' },
-          403: { description: 'Brak wymaganych uprawnień' },
+          401: { $ref: '#/components/responses/AdminUnauthorized' },
+          403: { $ref: '#/components/responses/AdminForbidden' },
+          500: { $ref: '#/components/responses/AdminServerError' },
+          503: { $ref: '#/components/responses/AdminUnavailable' },
         },
       },
     },
@@ -345,14 +467,18 @@ export const swaggerSpec = {
       delete: {
         tags: ['Administracja'],
         summary: 'Usunięcie cudzej recenzji (WF-17)',
+        description: 'Usuwa recenzję i zapisuje akcję w dzienniku moderacji (opcjonalny powód w treści żądania).',
         security: [{ BearerAuth: [] }],
-        parameters: [
-          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
-        ],
+        parameters: [{ $ref: '#/components/parameters/AdminId' }],
+        requestBody: { $ref: '#/components/requestBodies/ModerationReason' },
         responses: {
-          200: { description: 'Recenzja usunięta' },
-          403: { description: 'Brak wymaganych uprawnień' },
+          200: { description: '{ ok: true }' },
+          400: { $ref: '#/components/responses/AdminBadRequest' },
+          401: { $ref: '#/components/responses/AdminUnauthorized' },
+          403: { $ref: '#/components/responses/AdminForbidden' },
           404: { description: 'Recenzja nie istnieje' },
+          500: { $ref: '#/components/responses/AdminServerError' },
+          503: { $ref: '#/components/responses/AdminUnavailable' },
         },
       },
     },
@@ -361,10 +487,9 @@ export const swaggerSpec = {
       patch: {
         tags: ['Administracja'],
         summary: 'Wymuszenie / zdjęcie flagi spoilera (WF-11, WF-17)',
+        description: 'Flaga jest ustawiana tylko dla wartości dokładnie `true`; każda inna wartość ją zdejmuje.',
         security: [{ BearerAuth: [] }],
-        parameters: [
-          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
-        ],
+        parameters: [{ $ref: '#/components/parameters/AdminId' }],
         requestBody: {
           required: true,
           content: {
@@ -374,9 +499,13 @@ export const swaggerSpec = {
           },
         },
         responses: {
-          200: { description: 'Flaga zmieniona' },
-          403: { description: 'Brak wymaganych uprawnień' },
+          200: { description: '{ ok: true, is_spoiler }' },
+          400: { $ref: '#/components/responses/AdminBadRequest' },
+          401: { $ref: '#/components/responses/AdminUnauthorized' },
+          403: { $ref: '#/components/responses/AdminForbidden' },
           404: { description: 'Recenzja nie istnieje' },
+          500: { $ref: '#/components/responses/AdminServerError' },
+          503: { $ref: '#/components/responses/AdminUnavailable' },
         },
       },
     },
@@ -385,14 +514,18 @@ export const swaggerSpec = {
       delete: {
         tags: ['Administracja'],
         summary: 'Usunięcie cudzego komentarza (WF-16)',
+        description: 'Usuwa komentarz i zapisuje akcję w dzienniku moderacji (opcjonalny powód w treści żądania).',
         security: [{ BearerAuth: [] }],
-        parameters: [
-          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
-        ],
+        parameters: [{ $ref: '#/components/parameters/AdminId' }],
+        requestBody: { $ref: '#/components/requestBodies/ModerationReason' },
         responses: {
-          200: { description: 'Komentarz usunięty' },
-          403: { description: 'Brak wymaganych uprawnień' },
+          200: { description: '{ ok: true }' },
+          400: { $ref: '#/components/responses/AdminBadRequest' },
+          401: { $ref: '#/components/responses/AdminUnauthorized' },
+          403: { $ref: '#/components/responses/AdminForbidden' },
           404: { description: 'Komentarz nie istnieje' },
+          500: { $ref: '#/components/responses/AdminServerError' },
+          503: { $ref: '#/components/responses/AdminUnavailable' },
         },
       },
     },
@@ -404,11 +537,11 @@ export const swaggerSpec = {
         description:
           'Zmienia status konta. Moderator nie może moderować konta o randze Moderator/Admin. ' +
           'Status "blocked" dodatkowo blokuje logowanie w warstwie auth (na czas trwania kary). ' +
-          'Pole "until" wyznacza termin wygaśnięcia kary; jego brak/null oznacza karę na stałe.',
+          'Pole "until" wyznacza termin wygaśnięcia kary; jego brak/null oznacza karę na stałe. ' +
+          'Zmianę wykonuje funkcja bazy set_account_status tokenem moderatora (hierarchię ról egzekwuje baza); ' +
+          'wygasłe kary czasowe zdejmuje automatycznie /api/cron/sweep-sanctions.',
         security: [{ BearerAuth: [] }],
-        parameters: [
-          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
-        ],
+        parameters: [{ $ref: '#/components/parameters/AdminId' }],
         requestBody: {
           required: true,
           content: {
@@ -426,9 +559,26 @@ export const swaggerSpec = {
           },
         },
         responses: {
-          200: { description: 'Status zmieniony' },
-          400: { description: 'Nieprawidłowy status' },
-          403: { description: 'Brak uprawnień do moderacji tego konta' },
+          200: { description: '{ ok: true, status }' },
+          400: {
+            description:
+              'Nieprawidłowy status, nieprawidłowa data `until` („Nieprawidłowa data zakończenia kary"), ' +
+              'nieprawidłowy identyfikator, błędny JSON albo odrzucenie zmiany przez bazę (komunikat z bazy)',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, example: { error: 'Nieprawidłowy status konta' } } },
+          },
+          401: { $ref: '#/components/responses/AdminUnauthorized' },
+          403: { description: 'Brak uprawnień (rola) albo do moderacji tego konta (hierarchia ról w bazie)' },
+          500: {
+            description: 'Błąd weryfikacji uprawnień albo status zapisany, ale blokada logowania w Supabase Auth nie powiodła się',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Error' },
+                example: { error: 'Status zapisany, ale blokada logowania nie powiodła się' },
+              },
+            },
+          },
+          502: { $ref: '#/components/responses/DatabaseUnavailable' },
+          503: { $ref: '#/components/responses/AdminUnavailable' },
         },
       },
     },
@@ -437,10 +587,9 @@ export const swaggerSpec = {
       patch: {
         tags: ['Administracja'],
         summary: 'Zmiana roli użytkownika (WF-18, tylko Admin)',
+        description: 'Zmianę wykonuje funkcja bazy set_user_role tokenem administratora.',
         security: [{ BearerAuth: [] }],
-        parameters: [
-          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
-        ],
+        parameters: [{ $ref: '#/components/parameters/AdminId' }],
         requestBody: {
           required: true,
           content: {
@@ -454,8 +603,16 @@ export const swaggerSpec = {
           },
         },
         responses: {
-          200: { description: 'Rola zmieniona' },
-          403: { description: 'Wymagana rola Admin' },
+          200: { description: '{ ok: true, role }' },
+          400: {
+            description: 'Nieprawidłowa rola, nieprawidłowy identyfikator, błędny JSON albo odrzucenie zmiany przez bazę',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, example: { error: 'Nieprawidłowa rola' } } },
+          },
+          401: { $ref: '#/components/responses/AdminUnauthorized' },
+          403: { description: 'Wymagana rola Admin (lub odmowa bazy)' },
+          500: { $ref: '#/components/responses/AdminServerError' },
+          502: { $ref: '#/components/responses/DatabaseUnavailable' },
+          503: { $ref: '#/components/responses/AdminUnavailable' },
         },
       },
     },
@@ -535,6 +692,81 @@ export const swaggerSpec = {
         },
       },
     },
+
+    '/api/tmdb/{path}': {
+      get: {
+        tags: ['Proxy TMDB'],
+        summary: 'Proxy do TMDB API',
+        description:
+          'Przekazuje zapytanie GET do https://api.themoviedb.org/3/{path} z kluczem API doklejonym po stronie serwera ' +
+          '(parametry zapytania są przekazywane dalej). Dozwolone są wyłącznie ścieżki zaczynające się od ' +
+          '/movie, /discover, /search, /trending i /genre. Dla /search i /discover serwer wymusza include_adult=false. ' +
+          'Odpowiedzi OK są buforowane 10 min. Limit: 600 żądań na minutę na adres IP (liczony także dla ścieżek odrzuconych).',
+        parameters: [
+          {
+            name: 'path', in: 'path', required: true,
+            description: 'Ścieżka zasobu TMDB, np. movie/550/credits lub discover/movie',
+            schema: { type: 'string', example: 'discover/movie' },
+          },
+        ],
+        responses: {
+          '2XX': { description: 'Odpowiedź TMDB (status i treść przekazywane bez zmian)' },
+          403: {
+            description: 'Ścieżka spoza listy dozwolonych',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, example: { error: 'Niedozwolona ścieżka TMDB' } } },
+          },
+          429: {
+            description: 'Przekroczony limit żądań (bez nagłówka Retry-After)',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Error' },
+                example: { error: 'Zbyt wiele zapytań do TMDB. Spróbuj za chwilę.' },
+              },
+            },
+          },
+          502: {
+            description: 'Błąd komunikacji z TMDB',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, example: { error: 'Błąd komunikacji z TMDB' } } },
+          },
+          504: { $ref: '#/components/responses/TmdbTimeout' },
+        },
+      },
+    },
+
+    '/api/cron/sweep-sanctions': {
+      get: {
+        tags: ['Zadania serwera'],
+        summary: 'Zdjęcie wygasłych kar czasowych',
+        description:
+          'Wywoływane przez Vercel Cron (vercel.json). Przywraca status „active" kontom, których kara czasowa minęła ' +
+          '(kary permanentne są pomijane). Preferowana jest funkcja bazy sweep_expired_sanctions(); gdy jej brak, ' +
+          'serwer wykonuje równoważny PATCH. Wymaga nagłówka Authorization: Bearer <CRON_SECRET>.',
+        security: [{ CronSecret: [] }],
+        responses: {
+          200: {
+            description: 'Czyszczenie wykonane (Cache-Control: no-store)',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/SweepResult' } } },
+          },
+          401: {
+            description: 'Brak lub zły sekret',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, example: { error: 'Brak autoryzacji crona' } } },
+          },
+          500: {
+            description: 'Czyszczenie nie powiodło się (szczegóły w polu error)',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/SweepResult' } } },
+          },
+          503: {
+            description: 'CRON_SECRET nie jest skonfigurowany na serwerze',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/Error' },
+                example: { error: 'CRON_SECRET nie jest skonfigurowany na serwerze' },
+              },
+            },
+          },
+        },
+      },
+    },
   },
 
   components: {
@@ -545,6 +777,36 @@ export const swaggerSpec = {
         bearerFormat: 'JWT',
         description: 'Token JWT sesji Supabase (supabase.auth.getSession().data.session.access_token)',
       },
+      CronSecret: {
+        type: 'http',
+        scheme: 'bearer',
+        description: 'Wartość zmiennej CRON_SECRET (Vercel Cron wysyła ją automatycznie)',
+      },
+    },
+    parameters: {
+      AdminId: {
+        name: 'id', in: 'path', required: true,
+        description: 'UUID rekordu (recenzji, komentarza lub profilu). Inna wartość → 400 „Nieprawidłowy identyfikator".',
+        schema: { type: 'string', format: 'uuid' },
+      },
+      FeedLimit: {
+        name: 'limit', in: 'query',
+        description: 'Liczba pozycji każdego rodzaju: dodatnia liczba całkowita, maks. 50; brak lub inna wartość → 20',
+        schema: { type: 'integer', default: 20, minimum: 1, maximum: 50 },
+      },
+    },
+    requestBodies: {
+      ModerationReason: {
+        required: false,
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              properties: { reason: { type: 'string', nullable: true, description: 'Powód (zapisywany w dzienniku moderacji)' } },
+            },
+          },
+        },
+      },
     },
     schemas: {
       Config: {
@@ -552,12 +814,62 @@ export const swaggerSpec = {
         properties: {
           supabaseUrl:     { type: 'string', format: 'uri', description: 'URL projektu Supabase' },
           supabaseAnonKey: { type: 'string', description: 'Klucz anonimowy Supabase (publiczny)' },
+          siteUrl:         { type: 'string', format: 'uri', nullable: true, description: 'Publiczny adres aplikacji dla linków w e-mailach auth; null → adres bieżącej strony' },
+        },
+      },
+      Health: {
+        type: 'object',
+        properties: {
+          ok:                { type: 'boolean', description: 'Ustawione SUPABASE_URL, SUPABASE_ANON_KEY i TMDB_API_KEY' },
+          runtime:           { type: 'string', example: 'vercel:production', description: '"node" albo "vercel:<VERCEL_ENV>"' },
+          supabaseUrlSet:    { type: 'boolean' },
+          supabaseUrlValid:  { type: 'boolean', description: 'Format https://<host> bez ścieżki' },
+          anonKeySet:        { type: 'boolean' },
+          serviceKeySet:     { type: 'boolean' },
+          keysMatchProject:  { type: 'boolean', nullable: true, description: 'false: klucze z innego projektu Supabase; null: nie da się sprawdzić' },
+          envNeededCleanup: {
+            type: 'object',
+            description: 'true, gdy wartość w env zawierała spacje, cudzysłowy lub końcowy „/"',
+            properties: {
+              supabaseUrl: { type: 'boolean' },
+              anonKey:     { type: 'boolean' },
+              serviceKey:  { type: 'boolean' },
+            },
+          },
+          siteUrlConfigured: { type: 'boolean' },
+          cronSecretSet:     { type: 'boolean' },
+          tmdbKeySet:        { type: 'boolean' },
+        },
+      },
+      AgeRating: {
+        type: 'object',
+        properties: {
+          minAge:        { type: 'integer', nullable: true, description: 'Minimalny wiek bez opiekuna; null — brak klasyfikacji' },
+          certification: { type: 'string', nullable: true, example: '16' },
+          country:       { type: 'string', nullable: true, example: 'PL' },
+          label:         { type: 'string', nullable: true, example: '16+' },
+        },
+      },
+      SweepResult: {
+        type: 'object',
+        properties: {
+          ok:      { type: 'boolean' },
+          cleared: { type: 'integer', description: 'Liczba przywróconych kont' },
+          via:     { type: 'string', enum: ['rpc', 'patch'] },
+          error:   { type: 'string', description: 'Tylko przy ok = false' },
         },
       },
       Error: {
         type: 'object',
         properties: {
           error: { type: 'string', description: 'Opis błędu' },
+        },
+      },
+      AdminError: {
+        type: 'object',
+        properties: {
+          error: { type: 'string', description: 'Opis błędu' },
+          code:  { type: 'string', enum: ['token_missing', 'token_invalid', 'auth_unavailable'], description: 'Kod dla błędów sesji' },
         },
       },
       MovieSummary: {
@@ -604,7 +916,7 @@ export const swaggerSpec = {
                   },
                 },
               },
-              casts: {
+              credits: {
                 type: 'object',
                 properties: {
                   cast: { type: 'array', items: { type: 'object' } },
@@ -675,13 +987,70 @@ export const swaggerSpec = {
     },
     responses: {
       ServerError: {
-        description: 'Wewnętrzny błąd serwera',
+        description: 'Wewnętrzny błąd serwera (komunikat zależy od trasy; szczegóły tylko w logu serwera)',
         content: {
           'application/json': {
             schema: { $ref: '#/components/schemas/Error' },
             example: { error: 'Wewnętrzny błąd serwera' },
           },
         },
+      },
+      TmdbNotFound: {
+        description: 'TMDB nie zna zasobu',
+        content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, example: { error: 'Nie znaleziono zasobu w TMDB' } } },
+      },
+      TmdbError: {
+        description: 'Błąd komunikacji z TMDB (komunikat zależy od trasy)',
+        content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, example: { error: 'Błąd pobierania szczegółów filmu' } } },
+      },
+      TmdbTimeout: {
+        description: 'TMDB nie odpowiedział w ciągu 8 s (dotyczy także zawieszonego przesyłania treści)',
+        content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, example: { error: 'TMDB nie odpowiada (timeout)' } } },
+      },
+      TooManyRequests: {
+        description: 'Przekroczony limit zapytań na adres IP (nagłówek Retry-After: 60)',
+        content: {
+          'application/json': {
+            schema: { $ref: '#/components/schemas/Error' },
+            example: { error: 'Zbyt wiele zapytań o klasyfikacje wiekowe. Spróbuj za chwilę.' },
+          },
+        },
+      },
+      AdminUnauthorized: {
+        description: 'Brak tokenu (code: token_missing) albo token nieprawidłowy lub wygasły (code: token_invalid) — klient odświeża sesję i ponawia żądanie',
+        content: {
+          'application/json': {
+            schema: { $ref: '#/components/schemas/AdminError' },
+            example: { error: 'Nieprawidłowy lub wygasły token', code: 'token_invalid' },
+          },
+        },
+      },
+      AdminForbidden: {
+        description: 'Brak wymaganej roli',
+        content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, example: { error: 'Brak wymaganych uprawnień' } } },
+      },
+      AdminBadRequest: {
+        description: 'Identyfikator nie jest UUID albo treść żądania nie jest poprawnym JSON-em',
+        content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, example: { error: 'Nieprawidłowy identyfikator' } } },
+      },
+      AdminServerError: {
+        description: 'Błąd weryfikacji uprawnień albo zapytania do bazy (status błędu z Supabase lub 500)',
+        content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, example: { error: 'Błąd weryfikacji uprawnień' } } },
+      },
+      AdminUnavailable: {
+        description:
+          'Panel nieskonfigurowany (brak SUPABASE_SERVICE_ROLE_KEY) albo serwer nie może zweryfikować sesji ' +
+          '(code: auth_unavailable — błąd konfiguracji lub sieci po stronie serwera, nie sesji użytkownika)',
+        content: {
+          'application/json': {
+            schema: { $ref: '#/components/schemas/AdminError' },
+            example: { error: 'Panel administracyjny nie jest skonfigurowany (brak SUPABASE_SERVICE_ROLE_KEY).' },
+          },
+        },
+      },
+      DatabaseUnavailable: {
+        description: 'Baza nie odpowiedziała albo zwróciła błąd serwera (5xx) — zmiana nie została zapisana',
+        content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' }, example: { error: 'Nie udało się zmienić statusu konta' } } },
       },
     },
   },

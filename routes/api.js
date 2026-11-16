@@ -13,6 +13,7 @@ import { tmdbFetch, tmdbFailure } from '../lib/tmdb.js';
 import { resolveSiteUrl } from '../lib/siteUrl.js';
 import { getAgeRatings, parseIds, MAX_IDS } from '../lib/ageRatingsService.js';
 import { createRateLimiter } from '../lib/rateLimit.js';
+import { asyncHandler } from '../lib/asyncHandler.js';
 import { getMovieMeta, aggregateWatchStats, MAX_STATS_MOVIES } from '../lib/watchStats.js';
 import {
   excludedMovieIds, pickSourceMovies, rankRecommendations, REC_HISTORY_LIMIT,
@@ -58,7 +59,7 @@ function neededCleanup(raw, cleaned) {
 
 // Publiczna lista użytkownika (watchlist / watched): 404 bez profilu, 403 gdy prywatna.
 function publicListRoute({ visibilityColumn, table, select, order, logLabel, errorMessage }) {
-  return async (req, res) => {
+  return asyncHandler(async (req, res) => {
     try {
       const profiles = await sbFetch('profiles', { id: `eq.${req.params.id}`, select: visibilityColumn });
       if (!profiles.length)               return res.status(404).json(PROFILE_NOT_FOUND);
@@ -68,7 +69,7 @@ function publicListRoute({ visibilityColumn, table, select, order, logLabel, err
     } catch (err) {
       sendServerError(res, err, logLabel, errorMessage);
     }
-  };
+  });
 }
 
 // ── 0. GET /api/config ───────────────────────────────────────────────────────
@@ -110,7 +111,7 @@ router.get('/health', (_req, res) => {
 
 // ── 0c. GET /api/movies/age-ratings?ids=1,2,3 ────────────────────────────────
 // Musi być zarejestrowane PRZED /movies/:id, inaczej „age-ratings" byłoby traktowane jak ID.
-router.get('/movies/age-ratings', ageRatingsLimiter, async (req, res) => {
+router.get('/movies/age-ratings', ageRatingsLimiter, asyncHandler(async (req, res) => {
   const ids = parseIds(req.query.ids);
   if (!ids.length) {
     return res.status(400).json({ error: `Parametr ids jest wymagany (maks. ${MAX_IDS} liczb oddzielonych przecinkami)` });
@@ -127,19 +128,19 @@ router.get('/movies/age-ratings', ageRatingsLimiter, async (req, res) => {
     console.error('Age ratings error:', err?.message || err);
     res.status(502).json({ error: 'Błąd pobierania klasyfikacji wiekowych' });
   }
-});
+}));
 
 // ── 1. GET /api/movies/popular ────────────────────────────────────────────────
-router.get('/movies/popular', async (req, res) => {
+router.get('/movies/popular', asyncHandler(async (req, res) => {
   try {
     res.json(await tmdbFetch('/discover/movie', { sort_by: 'popularity.desc', page: req.query.page || 1 }));
   } catch (err) {
     sendTmdbError(res, err, 'Błąd pobierania popularnych filmów');
   }
-});
+}));
 
 // ── 2. GET /api/movies/search ─────────────────────────────────────────────────
-router.get('/movies/search', async (req, res) => {
+router.get('/movies/search', asyncHandler(async (req, res) => {
   const { query, page = 1 } = req.query;
   if (!query) return res.status(400).json({ error: 'Parametr query jest wymagany' });
   try {
@@ -147,20 +148,20 @@ router.get('/movies/search', async (req, res) => {
   } catch (err) {
     sendTmdbError(res, err, 'Błąd wyszukiwania filmów');
   }
-});
+}));
 
 // ── 3. GET /api/movies/:id ────────────────────────────────────────────────────
-router.get('/movies/:id', async (req, res) => {
+router.get('/movies/:id', asyncHandler(async (req, res) => {
   try {
     // 'credits' to udokumentowany klucz TMDB (zamiast reliktu 'casts')
     res.json(await tmdbFetch(`/movie/${req.params.id}`, { append_to_response: 'credits,videos' }));
   } catch (err) {
     sendTmdbError(res, err, 'Błąd pobierania szczegółów filmu');
   }
-});
+}));
 
 // ── 4. GET /api/movies/:id/reviews ───────────────────────────────────────────
-router.get('/movies/:id/reviews', async (req, res) => {
+router.get('/movies/:id/reviews', asyncHandler(async (req, res) => {
   try {
     res.json(await sbFetch('reviews', {
       movie_id: `eq.${req.params.id}`,
@@ -170,10 +171,10 @@ router.get('/movies/:id/reviews', async (req, res) => {
   } catch (err) {
     sendServerError(res, err, 'Reviews fetch', 'Błąd pobierania recenzji');
   }
-});
+}));
 
 // ── 5. GET /api/profiles/:id ──────────────────────────────────────────────────
-router.get('/profiles/:id', async (req, res) => {
+router.get('/profiles/:id', asyncHandler(async (req, res) => {
   try {
     const profiles = await sbFetch('profiles', {
       id:     `eq.${req.params.id}`,
@@ -184,7 +185,7 @@ router.get('/profiles/:id', async (req, res) => {
   } catch (err) {
     sendServerError(res, err, 'Profile fetch', 'Błąd pobierania profilu');
   }
-});
+}));
 
 // ── 6–7. GET /api/profiles/:id/watchlist | /watched ──────────────────────────
 router.get('/profiles/:id/watchlist', publicListRoute({
@@ -208,7 +209,7 @@ router.get('/profiles/:id/watched', publicListRoute({
 // ── 7b. GET /api/profiles/:id/stats ──────────────────────────────────────────
 // Statystyki (WF-14) liczone w locie z listy `watched` + danych TMDB.
 // Własne widzi właściciel (token); cudze tylko gdy watched_public=true.
-router.get('/profiles/:id/stats', async (req, res) => {
+router.get('/profiles/:id/stats', asyncHandler(async (req, res) => {
   const profileId = req.params.id;
   const token     = bearerToken(req);
 
@@ -242,12 +243,12 @@ router.get('/profiles/:id/stats', async (req, res) => {
   } catch (err) {
     sendServerError(res, err, 'Stats error', 'Błąd obliczania statystyk');
   }
-});
+}));
 
 // ── 8. GET /api/recommendations ──────────────────────────────────────────────
 // Rekomendacje TMDB dla filmów źródłowych (oceny + historia) z własnym rankingiem.
 // Tożsamość wynika z tokenu JWT, nie z parametru — bezpieczeństwo nie zależy od query.
-router.get('/recommendations', async (req, res) => {
+router.get('/recommendations', asyncHandler(async (req, res) => {
   const userToken = bearerToken(req);
   if (!userToken) return res.status(401).json({ error: 'Brak tokenu autoryzacji' });
 
@@ -276,6 +277,6 @@ router.get('/recommendations', async (req, res) => {
   } catch (err) {
     sendServerError(res, err, 'Recommendations error', 'Błąd pobierania rekomendacji');
   }
-});
+}));
 
 export default router;
