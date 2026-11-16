@@ -774,6 +774,11 @@ body {
   width: 100%;
 }
 
+/* Karty w poziomych sliderach mają stałą szerokość — nie kurczą się w układzie flex */
+.slider-list .slider-inner > .movie-card {
+  flex-shrink: 0;
+}
+
 .movie-card .title {
   width: 100%;
   white-space: nowrap;
@@ -1323,9 +1328,15 @@ body {
     grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
     column-gap: 10px;
   }
-  .movie-card {
+  /* Tylko siatka wyników — wcześniej reguła obejmowała też karty w poziomych sliderach,
+     które w układzie flex kurczyły się różnie (szerokość zależna od treści karty) */
+  .grid-list .movie-card {
     min-width: auto;
     width: 90%;
+  }
+  .slider-list .slider-inner > .movie-card {
+    min-width: 150px;
+    max-width: 150px;
   }
 }
 @media (max-width: 574px) {
